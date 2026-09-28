@@ -33,6 +33,7 @@
 #define BBS_VERDATE     "?"
 #endif
 #define BBS_SEMNAME     "NilBBS.shared"
+#define SERIAL_TASKNAME "NilBBS Serial"     /* BBSNode SERIAL, waiting or on a call */
 #define BBS_SHARED_MAGIC 0x414D4242UL      /* 'AMBB' */
 #define BBS_SHARED_VER   5                 /* bump when BBSShared changes */
 

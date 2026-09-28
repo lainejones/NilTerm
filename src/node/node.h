@@ -40,6 +40,7 @@ struct NodeCtx {
     int    node;                /* 1-based node number */
     LONG   sock;
     BOOL   local;               /* a console session (BBSNode LOCAL), no socket */
+    BOOL   serial;              /* a serial-port caller (BBSNode SERIAL, serial.c), no socket */
     BPTR   lcon;                /* ... its CON: window, raw mode */
     struct BBSShared *S;
     struct NodeInfo  *ni;
@@ -103,6 +104,13 @@ struct NodeCtx {
 };
 
 extern struct NodeCtx N;
+
+/* serial.c - BBSNode SERIAL */
+BOOL ser_open(void);
+void ser_close(void);
+BOOL ser_wait_call(char *how, int max);
+void ser_write(const UBYTE *p, LONG n);
+LONG ser_wait(ULONG ms, ULONG extrasigs, ULONG *gotsigs, void (*put)(UBYTE));
 
 /* telnet.c */
 void tn_start(void);
