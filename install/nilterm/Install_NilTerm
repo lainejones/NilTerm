@@ -1,0 +1,71 @@
+; -------------------------------------------------------------------------
+; NilTerm - Installer script
+; Needs the standard Installer (part of AmigaOS 3.x), AmigaOS 3.0 or newer,
+; a 68020 or better and a TCP/IP stack (Roadshow, Miami, AmiTCP).
+; Double-click Install_NilTerm, or from a Shell in this drawer:
+;     Installer Install_NilTerm
+;
+; Copies the NilTerm drawer where you choose.  Run it again to update: the
+; program, icon, ReadMe and manual are replaced; your dialing directory and
+; settings live in ENVARC: and are never touched.
+; -------------------------------------------------------------------------
+(set @app-name "NilTerm")
+(complete 0)
+
+; ---- the machine ---------------------------------------------------------
+(if (< (/ (getversion "exec.library" (resident)) 65536) 39)
+    (abort "NilTerm needs AmigaOS 3.0 or newer."))
+(set cpu (database "cpu"))
+(if (or (= cpu "68000") (= cpu "68010"))
+    (abort "NilTerm needs a 68020 or better processor (this Amiga has a " cpu ")."))
+(if (not (exists "NilTerm/NilTerm"))
+    (abort "Can't find the NilTerm drawer next to this script.\n\n"
+           "Run the installer from the drawer it came in (the one holding NilTerm)."))
+
+(message "Welcome to NilTerm.\n\n"
+         "NilTerm is an ANSI telnet client for calling BBSes: the IBM PC font and "
+         "colours on its own screen, a dialing directory, scrollback, session capture "
+         "and ZMODEM / YMODEM / XMODEM file transfers.\n\n"
+         "It needs a TCP/IP stack (Roadshow, Miami or AmiTCP) to make calls.")
+
+(if (= (exists "LIBS:bsdsocket.library") 0)
+    (if (= (exists "bsdsocket.library" (resident)) 0)
+        (message "No bsdsocket.library was found in LIBS:.\n\n"
+                 "That's fine if your TCP/IP stack keeps it elsewhere or is started later "
+                 "(Roadshow and Miami do) - NilTerm needs it only when it makes a call.")))
+
+; ---- where ---------------------------------------------------------------
+(set instdest
+    (askdir
+        (prompt "Where should NilTerm go?\n\nA drawer called NilTerm is made inside the one you choose.")
+        (help "Anywhere will do - it needs about 150 KB. Your dialing directory and "
+              "settings are kept in ENVARC:, not in this drawer.")
+        (default "SYS:Utilities")))
+(set termdir (tackon instdest "NilTerm"))
+(set @default-dest termdir)
+(set is_update (exists (tackon termdir "NilTerm")))
+(complete 20)
+
+; ---- copy ----------------------------------------------------------------
+(if (= is_update 0)
+    (makedir termdir))
+(copyfiles (prompt "Copying NilTerm") (help @copyfiles-help)
+    (source "NilTerm.info") (dest instdest) (nogauge))    ; the drawer's icon
+(copyfiles
+    (prompt "Copying NilTerm")
+    (help @copyfiles-help)
+    (source "NilTerm")
+    (dest termdir)
+    (choices "NilTerm" "NilTerm.guide" "ReadMe" "LICENSE")
+    (infos)
+    (nogauge))
+(complete 90)
+
+(exit
+    (if is_update
+        (cat "NilTerm has been updated in\n" termdir "\n\n"
+             "Your dialing directory and settings were kept.")
+        (cat "NilTerm is installed in\n" termdir "\n\n"
+             "Double-click NilTerm to open the dialing directory: A adds a system, "
+             "Return calls it. Help shows the keys; NilTerm.guide is the manual."))
+    (quiet))

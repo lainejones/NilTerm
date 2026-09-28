@@ -1,0 +1,2030 @@
+/*
+ * NilTerm - an ANSI telnet client for the Amiga (and the NilBBS sysop's terminal).
+ *
+ *   NilTerm [PORT=]n [HOST=name] [MODEID=hex] [NATIVE] [SMALL]
+ *
+ * Opens its own 640x400 16-colour screen (the VGA palette) with 80x25 cells of
+ * 8x16, draws every byte 0x20-0xFF as its CP437 glyph (the IBM VGA 8x16 font in
+ * nilfont.h), and telnets to NilBBS on this Amiga (127.0.0.1; with no PORT= it
+ * uses the port the running NilBBS listens on, else port= in NilBBS.cfg, else 2323).  It answers the node's terminal detection like SyncTERM does:
+ * TTYPE "ANSI", NAWS 80x25, a cursor position report for ESC[6n - so the node
+ * picks ANSI + CP437 + 80x25.
+ *
+ * Screen mode: MODEID= if given, else BestModeID() for 640x400x4 (the RTG mode
+ * on a graphics card), else hires-interlaced (default / PAL / NTSC monitor).
+ * NATIVE skips BestModeID (tests the chipset path on an RTG machine).  With no
+ * 400-line mode, or SMALL, it runs 640x200 with half-height glyphs (each pair
+ * of font rows OR'ed into one).
+ *
+ * Drawing: the font is a TextFont made in memory over a 1-plane strip in chip
+ * RAM, so a run of same-coloured characters is ONE Text() call (the blitter on
+ * a chipset screen, the card's driver on RTG).  A whole recv() burst is parsed
+ * into a cell buffer first; only the dirty spans are drawn, and scrolling is
+ * one ScrollRaster per burst, however many lines went by.
+ *
+ * Keys: arrows ESC[A-D, Shift+Up/Down = PgUp/PgDn (ESC[5~ ESC[6~), Shift+Left/
+ * Right = Home/End (ESC[H ESC[K), Del ESC[3~, Backspace 08, Return CR; the
+ * Home/End/PgUp/PgDn/Insert keys of a PC-style keyboard too.  Help = about.
+ * Amiga-Q quits; so does the BBS hanging up, and CTRL-C (Break).
+ */
+#include <exec/types.h>
+#include <exec/memory.h>
+#include <dos/dos.h>
+#include <dos/rdargs.h>
+#include <intuition/intuition.h>
+#include <intuition/screens.h>
+#include <graphics/gfx.h>
+#include <graphics/gfxbase.h>
+#include <graphics/text.h>
+#include <graphics/rastport.h>
+#include <graphics/modeid.h>
+#include <graphics/displayinfo.h>
+#include <devices/inputevent.h>
+#include <workbench/startup.h>
+#include <workbench/workbench.h>
+#include <proto/exec.h>
+#include <proto/icon.h>
+#include <proto/dos.h>
+#include <proto/intuition.h>
+#include <proto/graphics.h>
+#include <proto/keymap.h>
+#include <proto/asl.h>
+#include <libraries/asl.h>
+#include <proto/iffparse.h>
+#include <libraries/iffparse.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netdb.h>
+#include <proto/bsdsocket.h>
+
+#include "../common/bbs.h"
+#include "ntzio.h"
+#include "../node/zmodem.h"
+#include "nilfont.h"
+
+static const char __attribute__((used)) verstag[] =
+    "$VER: NilTerm " BBS_VERSION " (" BBS_VERDATE ") font: IBM VGA 8x16 by VileR (int10h.org), CC BY-SA 4.0";
+
+struct IntuitionBase *IntuitionBase;
+struct GfxBase *GfxBase;
+struct Library *KeymapBase;
+struct Library *SocketBase;
+struct Library *AslBase, *IFFParseBase;     /* optional: the file requester, the clipboard */
+
+#define COLS 80
+#define SROWS 25                    /* screen rows: the terminal + the status bar */
+static int ROWS = SROWS - 1;        /* terminal rows: 24 under the status bar, 25 without one (WATCH=) */
+
+/* ---- the screen ------------------------------------------------------------------- */
+static struct Screen *scr;
+static struct Window *win;
+static struct RastPort *rp;
+static UBYTE *strip;                /* the font: 256 glyphs side by side, 1 plane, chip RAM */
+static ULONG charloc[257];
+static struct TextFont vfont;
+static int CH = 16;                 /* cell height: 16, or 8 on a 200-line screen */
+static ULONG modeid = INVALID_ID;
+static char modename[DISPLAYNAMELEN + 1];
+
+/* the VGA palette, in ANSI colour order (30-37, then the bright ones) */
+static const UBYTE vga[16][3] = {
+    {0,0,0}, {170,0,0}, {0,170,0}, {170,85,0}, {0,0,170}, {170,0,170}, {0,170,170}, {170,170,170},
+    {85,85,85}, {255,85,85}, {85,255,85}, {255,255,85}, {85,85,255}, {255,85,255}, {85,255,255}, {255,255,255}
+};
+
+/* ---- the terminal state ------------------------------------------------------------ */
+static UBYTE chr[SROWS][COLS], att[SROWS][COLS];     /* att = fg pen | bg pen << 4 */
+static BYTE dmin[SROWS], dmax[SROWS];                 /* dirty span per row (dmin > dmax = clean) */
+static int cx, cy;                                  /* cursor, 0-based */
+static int stop = 0, sbot = SROWS - 2;              /* scroll region */
+static int fg = 7, bg = 0, bold, rev;
+static UBYTE curattr = 0x07;
+static BOOL autowrap = TRUE, curvis = TRUE;
+static int sv_x, sv_y, sv_fg = 7, sv_bg, sv_bold, sv_rev;   /* ESC 7 / ESC[s */
+static int pend_n, pend_top, pend_bot;              /* scrolling not yet done on screen */
+static BOOL cur_drawn;
+static int cur_dx, cur_dy;
+static BOOL beeped;
+
+static enum { S_NORM, S_ESC, S_CSI, S_SKIP1 } pstate;
+#define MAXPAR 16
+static int par[MAXPAR], npar;
+static BOOL par_any;
+static char priv;                                   /* '?', '=', '<', '>' or 0 */
+static BOOL inter;                                  /* an intermediate byte: not a sequence we know */
+
+/* ---- the connection ------------------------------------------------------------------ */
+static LONG sock = -1;
+static BOOL closed;
+static UBYTE ob[1024];
+static int obn;
+
+static void net_send(const UBYTE *p, int n)
+{
+    while (n > 0 && sock >= 0) {
+        LONG k = send(sock, (APTR)p, n, 0);
+        if (k <= 0) { closed = TRUE; return; }
+        p += k; n -= k;
+    }
+}
+static void ob_flush(void) { if (obn) net_send(ob, obn); obn = 0; }
+static void ob_put(UBYTE c) { if (obn >= (int)sizeof(ob)) ob_flush(); ob[obn++] = c; }
+static void ob_str(const char *s) { while (*s) ob_put((UBYTE)*s++); }
+static void ob_data(UBYTE c) { ob_put(c); if (c == 255) ob_put(255); }   /* IAC doubled */
+
+/* ---- drawing ------------------------------------------------------------------------ */
+static void mark(int y, int x0, int x1)
+{
+    if (x0 < dmin[y]) dmin[y] = x0;
+    if (x1 > dmax[y]) dmax[y] = x1;
+}
+
+static void draw_cells(int y, int x0, int x1)
+{
+    while (x0 <= x1) {
+        UBYTE a = att[y][x0];
+        int e = x0 + 1;
+        while (e <= x1 && att[y][e] == a) e++;
+        SetABPenDrMd(rp, a & 15, a >> 4, JAM2);
+        Move(rp, x0 * 8, y * CH + vfont.tf_Baseline);
+        Text(rp, (STRPTR)&chr[y][x0], e - x0);
+        x0 = e;
+    }
+}
+
+/* put the pending scroll and every dirty span on the screen */
+static void flush_draw(void)
+{
+    int y;
+    if (pend_n) {
+        int h = pend_bot - pend_top + 1;
+        if (pend_n < h)
+            ScrollRaster(rp, 0, pend_n * CH, 0, pend_top * CH, COLS * 8 - 1, (pend_bot + 1) * CH - 1);
+        pend_n = 0;             /* (a scroll of the whole region left every row dirty anyway) */
+    }
+    for (y = 0; y < SROWS; y++)
+        if (dmin[y] <= dmax[y]) {
+            draw_cells(y, dmin[y], dmax[y]);
+            dmin[y] = COLS; dmax[y] = -1;
+        }
+}
+
+static void cursor_hide(void)
+{
+    if (!cur_drawn) return;
+    draw_cells(cur_dy, cur_dx, cur_dx);
+    cur_drawn = FALSE;
+}
+
+static void cursor_show(void)
+{
+    int x = cx < COLS ? cx : COLS - 1;
+    if (!curvis || cur_drawn) return;
+    SetAPen(rp, (att[cy][x] & 15) == (att[cy][x] >> 4) ? 7 : att[cy][x] & 15);
+    SetDrMd(rp, JAM1);
+    RectFill(rp, x * 8, cy * CH + CH - 2, x * 8 + 7, cy * CH + CH - 1);
+    cur_drawn = TRUE; cur_dx = x; cur_dy = cy;
+}
+
+static void flush(void) { flush_draw(); cursor_show(); }
+
+/* ---- the cell buffer ------------------------------------------------------------------ */
+static void blank(int y, int x0, int x1)
+{
+    int x;
+    if (x0 < 0) x0 = 0;
+    if (x1 > COLS - 1) x1 = COLS - 1;
+    if (x0 > x1) return;
+    for (x = x0; x <= x1; x++) { chr[y][x] = ' '; att[y][x] = curattr; }
+    mark(y, x0, x1);
+}
+
+/* ---- scrollback: lines that scroll off the top of the whole screen ------------------------- */
+#define SBMAX 2000
+static UBYTE *sb_chr, *sb_att;          /* SBMAX lines of COLS, a ring */
+static int sb_head, sb_count;           /* next slot, lines held */
+
+static void sb_push(int y)
+{
+    if (!sb_chr) return;
+    memcpy(sb_chr + sb_head * COLS, chr[y], COLS);
+    memcpy(sb_att + sb_head * COLS, att[y], COLS);
+    sb_head = (sb_head + 1) % SBMAX;
+    if (sb_count < SBMAX) sb_count++;
+}
+
+static void scroll_up(int top, int bot, int n)
+{
+    int h = bot - top + 1, y;
+    if (n <= 0 || top > bot) return;
+    if (n > h) n = h;
+    if (top == 0 && bot == ROWS - 1)            /* a whole-screen scroll: keep what goes off the top */
+        for (y = 0; y < n; y++) sb_push(y);
+    if (pend_n && (pend_top != top || pend_bot != bot)) flush_draw();
+    for (y = top; y + n <= bot; y++) {
+        memcpy(chr[y], chr[y + n], COLS);
+        memcpy(att[y], att[y + n], COLS);
+        dmin[y] = dmin[y + n]; dmax[y] = dmax[y + n];
+    }
+    for (y = bot - n + 1; y <= bot; y++) { dmin[y] = COLS; dmax[y] = -1; blank(y, 0, COLS - 1); }
+    pend_top = top; pend_bot = bot;
+    pend_n += n;
+    if (pend_n > h) pend_n = h;
+}
+
+static void scroll_down(int top, int bot, int n)
+{
+    int h = bot - top + 1, y;
+    if (n <= 0 || top > bot) return;
+    if (n > h) n = h;
+    flush_draw();               /* the screen matches the buffer now: move both the same way */
+    if (n < h) ScrollRaster(rp, 0, -n * CH, 0, top * CH, COLS * 8 - 1, (bot + 1) * CH - 1);
+    for (y = bot; y - n >= top; y--) {
+        memcpy(chr[y], chr[y - n], COLS);
+        memcpy(att[y], att[y - n], COLS);
+    }
+    for (y = top; y < top + n; y++) blank(y, 0, COLS - 1);
+}
+
+static void linefeed(void)
+{
+    if (cy == sbot) scroll_up(stop, sbot, 1);
+    else if (cy < ROWS - 1) cy++;
+}
+
+static void set_attr(void)
+{
+    int f = fg < 8 && bold ? fg + 8 : fg, b = bg;
+    if (rev) { int t = f; f = b; b = t; }
+    curattr = (UBYTE)(f | (b << 4));
+}
+
+static void reset_term(void)
+{
+    int y;
+    fg = 7; bg = 0; bold = rev = 0; set_attr();
+    stop = 0; sbot = ROWS - 1; autowrap = TRUE; curvis = TRUE;
+    for (y = 0; y < ROWS; y++) blank(y, 0, COLS - 1);
+    cx = cy = 0;
+}
+
+static void put_glyph(UBYTE c)
+{
+    chr[cy][cx] = c; att[cy][cx] = curattr;
+    mark(cy, cx, cx);
+    if (++cx >= COLS) {
+        /* wrap at once, as SyncTERM (cterm) does: a CR LF after 80 columns double-spaces */
+        if (autowrap) { cx = 0; linefeed(); }
+        else cx = COLS - 1;
+    }
+}
+
+/* ---- the ANSI parser --------------------------------------------------------------- */
+static int P(int i, int def) { return i < npar && par[i] > 0 ? par[i] : def; }
+static int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+static void sgr(void)
+{
+    int i;
+    if (npar == 0) { npar = 1; par[0] = 0; }
+    for (i = 0; i < npar; i++) {
+        int p = par[i];
+        if (p == 0) { fg = 7; bg = 0; bold = rev = 0; }
+        else if (p == 1) bold = 1;
+        else if (p == 2 || p == 22) bold = 0;
+        else if (p == 7) rev = 1;
+        else if (p == 27) rev = 0;
+        else if (p >= 30 && p <= 37) fg = p - 30;
+        else if (p == 39) fg = 7;
+        else if (p >= 40 && p <= 47) bg = p - 40;
+        else if (p == 49) bg = 0;
+        else if (p >= 90 && p <= 97) fg = p - 90 + 8;
+        else if (p >= 100 && p <= 107) bg = p - 100 + 8;
+        else if (p == 38 || p == 48) {          /* 256-colour / true colour: skip its arguments */
+            if (i + 1 < npar && par[i + 1] == 5) i += 2;
+            else if (i + 1 < npar && par[i + 1] == 2) i += 4;
+        }
+        /* 4/24 underline, 5/6/25 blink, 8 conceal: shown as plain text */
+    }
+    set_attr();
+}
+
+static void csi_final(UBYTE f)
+{
+    int n, y;
+    char tmp[24];
+    if (inter) return;
+    if (priv) {
+        if (priv == '?' && (f == 'h' || f == 'l')) {
+            int i;
+            for (i = 0; i < npar; i++) {
+                if (par[i] == 25) curvis = (f == 'h');
+                else if (par[i] == 7) autowrap = (f == 'h');
+            }
+        }
+        return;                 /* ESC[=..h, ESC[?33h (iCE colours) etc.: ignored */
+    }
+    switch (f) {
+    case 'A': cy = clampi(cy - P(0, 1), cy >= stop ? stop : 0, ROWS - 1); break;
+    case 'B': case 'e': cy = clampi(cy + P(0, 1), 0, cy <= sbot ? sbot : ROWS - 1); break;
+    case 'C': case 'a': cx = clampi(cx + P(0, 1), 0, COLS - 1); break;
+    case 'D': cx = clampi(cx - P(0, 1), 0, COLS - 1); break;
+    case 'E': cy = clampi(cy + P(0, 1), 0, ROWS - 1); cx = 0; break;
+    case 'F': cy = clampi(cy - P(0, 1), 0, ROWS - 1); cx = 0; break;
+    case 'G': case '`': cx = clampi(P(0, 1) - 1, 0, COLS - 1); break;
+    case 'd': cy = clampi(P(0, 1) - 1, 0, ROWS - 1); break;
+    case 'H': case 'f':
+        cy = clampi(P(0, 1) - 1, 0, ROWS - 1);
+        cx = clampi(P(1, 1) - 1, 0, COLS - 1);
+        break;
+    case 'I': n = P(0, 1); while (n-- > 0) cx = (cx / 8 + 1) * 8; if (cx > COLS - 1) cx = COLS - 1; break;
+    case 'Z': n = P(0, 1); while (n-- > 0 && cx > 0) cx = (cx - 1) / 8 * 8; break;
+    case 'J':
+        n = P(0, 0);
+        if (n == 0) { blank(cy, cx, COLS - 1); for (y = cy + 1; y < ROWS; y++) blank(y, 0, COLS - 1); }
+        else if (n == 1) { for (y = 0; y < cy; y++) blank(y, 0, COLS - 1); blank(cy, 0, cx); }
+        else { for (y = 0; y < ROWS; y++) blank(y, 0, COLS - 1); if (n == 2) cx = cy = 0; }  /* ANSI.SYS homes */
+        break;
+    case 'K':
+        n = P(0, 0);
+        if (n == 0) blank(cy, cx, COLS - 1);
+        else if (n == 1) blank(cy, 0, cx);
+        else blank(cy, 0, COLS - 1);
+        break;
+    case 'X': blank(cy, cx, cx + P(0, 1) - 1); break;
+    case '@':               /* insert blanks */
+        n = clampi(P(0, 1), 1, COLS - cx);
+        memmove(&chr[cy][cx + n], &chr[cy][cx], COLS - cx - n);
+        memmove(&att[cy][cx + n], &att[cy][cx], COLS - cx - n);
+        mark(cy, cx, COLS - 1);
+        blank(cy, cx, cx + n - 1);
+        break;
+    case 'P':               /* delete characters */
+        n = clampi(P(0, 1), 1, COLS - cx);
+        memmove(&chr[cy][cx], &chr[cy][cx + n], COLS - cx - n);
+        memmove(&att[cy][cx], &att[cy][cx + n], COLS - cx - n);
+        mark(cy, cx, COLS - 1);
+        blank(cy, COLS - n, COLS - 1);
+        break;
+    case 'L': if (cy >= stop && cy <= sbot) scroll_down(cy, sbot, P(0, 1)); cx = 0; break;
+    case 'M': if (cy >= stop && cy <= sbot) scroll_up(cy, sbot, P(0, 1)); cx = 0; break;
+    case 'S': scroll_up(stop, sbot, P(0, 1)); break;
+    case 'T': scroll_down(stop, sbot, P(0, 1)); break;
+    case 'r': {
+        int t = P(0, 1) - 1, b = P(1, ROWS) - 1;
+        if (t < 0) t = 0;
+        if (b > ROWS - 1) b = ROWS - 1;
+        if (t < b) { stop = t; sbot = b; } else { stop = 0; sbot = ROWS - 1; }
+        cx = cy = 0;
+        break;
+    }
+    case 'm': sgr(); break;
+    case 's': sv_x = cx; sv_y = cy; break;
+    case 'u': cx = sv_x; cy = sv_y; break;
+    case 'n':
+        if (P(0, 0) == 6) {                 /* cursor position report: what the node detects us by */
+            sprintf(tmp, "\x1b[%d;%dR", cy + 1, cx + 1);
+            ob_str(tmp);
+        } else if (P(0, 0) == 5) ob_str("\x1b[0n");
+        break;
+    default: break;         /* 'c' (DA) unanswered, like ANSI.SYS; 't', 'q'...: ignored */
+    }
+}
+
+static void ansi_byte(UBYTE c)
+{
+    switch (pstate) {
+    case S_SKIP1: pstate = S_NORM; return;
+    case S_ESC:
+        pstate = S_NORM;
+        switch (c) {
+        case '[': pstate = S_CSI; npar = 0; par_any = FALSE; priv = 0; inter = FALSE; par[0] = 0; return;
+        case '7': sv_x = cx; sv_y = cy; sv_fg = fg; sv_bg = bg; sv_bold = bold; sv_rev = rev; return;
+        case '8': cx = sv_x; cy = sv_y; fg = sv_fg; bg = sv_bg; bold = sv_bold; rev = sv_rev; set_attr(); return;
+        case 'D': linefeed(); return;
+        case 'E': cx = 0; linefeed(); return;
+        case 'M':
+            if (cy == stop) scroll_down(stop, sbot, 1);
+            else if (cy > 0) cy--;
+            return;
+        case 'c': reset_term(); return;
+        case '(': case ')': case '*': case '+': case '#': case '%': pstate = S_SKIP1; return;
+        case 27: pstate = S_ESC; return;
+        default: return;    /* ESC = / ESC > etc. */
+        }
+    case S_CSI:
+        if (c >= '0' && c <= '9') {
+            if (!par_any) { npar = 1; par_any = TRUE; }
+            if (par[npar - 1] < 10000) par[npar - 1] = par[npar - 1] * 10 + (c - '0');
+            return;
+        }
+        if (c == ';') {
+            if (!par_any) { npar = 1; par_any = TRUE; }
+            if (npar < MAXPAR) par[npar++] = 0;
+            return;
+        }
+        if (c >= '<' && c <= '?') { if (!par_any && !priv) priv = c; else inter = TRUE; return; }
+        if (c == ':') { inter = TRUE; return; }
+        if (c >= 0x20 && c <= 0x2F) { inter = TRUE; return; }
+        if (c >= 0x40 && c <= 0x7E) { pstate = S_NORM; csi_final(c); return; }
+        if (c == 27) { pstate = S_ESC; return; }
+        if (c == 24 || c == 26) { pstate = S_NORM; return; }    /* CAN / SUB abort it */
+        if (c >= 0x20) return;                                  /* DEL */
+        /* other control characters inside a sequence act as usual */
+        break;
+    case S_NORM:
+        break;
+    }
+
+    if (c >= 0x20) { put_glyph(c); return; }
+    switch (c) {
+    case 7: if (!beeped) { DisplayBeep(scr); beeped = TRUE; } break;
+    case 8: if (cx > 0) cx--; break;
+    case 9: cx = (cx / 8 + 1) * 8; if (cx > COLS - 1) cx = COLS - 1; break;
+    case 10: case 11: linefeed(); break;
+    case 12: { int y; for (y = 0; y < ROWS; y++) blank(y, 0, COLS - 1); cx = cy = 0; break; }  /* ^L: clear */
+    case 13: cx = 0; break;
+    case 27: pstate = S_ESC; break;
+    default: break;         /* other control bytes: nothing */
+    }
+}
+
+static void term_write(const UBYTE *p, LONG n)
+{
+    while (n-- > 0) ansi_byte(*p++);
+}
+static void term_str(const char *s) { term_write((const UBYTE *)s, strlen(s)); }
+
+/* ---- capture: the session to a file, raw ANSI or plain text ---------------------------------- */
+static BPTR cap_fh;
+static BOOL cap_plain;
+static UBYTE cap_buf[2048];
+static int cap_n, cap_esc;              /* plain: 0 text, 1 after ESC, 2 inside ESC[ ... */
+
+static void cap_flush(void) { if (cap_fh && cap_n) Write(cap_fh, cap_buf, cap_n); cap_n = 0; }
+static void cap_put(UBYTE c) { if (cap_n >= (int)sizeof(cap_buf)) cap_flush(); cap_buf[cap_n++] = c; }
+
+static void capture_byte(UBYTE c)
+{
+    if (!cap_plain) { cap_put(c); return; }
+    if (cap_esc == 1) { cap_esc = c == '[' ? 2 : 0; return; }
+    if (cap_esc == 2) { if (c >= 0x40 && c <= 0x7E) cap_esc = 0; return; }
+    if (c == 27) { cap_esc = 1; return; }
+    if (c == '\n' || c == '\t' || c >= 0x20) cap_put(c);    /* CRs dropped: LF ends a line */
+}
+
+/* every byte of the session that isn't telnet - the screen, the log, the ZMODEM watcher;
+ * while a transfer runs, the transfer's input ring instead */
+static void zm_watch(UBYTE c);
+static BOOL xfer;
+static void zin_put(UBYTE c);
+static void data_byte(UBYTE c)
+{
+    if (xfer) { zin_put(c); return; }
+    if (cap_fh) capture_byte(c);
+    zm_watch(c);
+    ansi_byte(c);
+}
+
+/* ---- telnet --------------------------------------------------------------------------- */
+#define IAC  255
+#define DONT 254
+#define DO   253
+#define WONT 252
+#define WILL 251
+#define SB   250
+#define SE   240
+#define O_BINARY 0
+#define O_ECHO   1
+#define O_SGA    3
+#define O_TTYPE  24
+#define O_NAWS   31
+
+static UBYTE us[256], them[256];
+static enum { T_DATA, T_IAC, T_OPT, T_SB, T_SBIAC } tstate;
+static UBYTE tverb;
+static UBYTE sbbuf[64];
+static int sblen;
+
+static void tn_cmd(UBYTE verb, UBYTE opt) { ob_put(IAC); ob_put(verb); ob_put(opt); }
+
+static void tn_naws(void)
+{
+    UBYTE naws[] = { IAC, SB, O_NAWS, 0, COLS, 0, 0, IAC, SE };
+    int i;
+    naws[6] = (UBYTE)ROWS;
+    for (i = 0; i < (int)sizeof(naws); i++) ob_put(naws[i]);
+}
+
+static void tn_option(UBYTE verb, UBYTE opt)
+{
+    switch (verb) {
+    case DO:                    /* may we ...? */
+        if (opt == O_TTYPE || opt == O_NAWS || opt == O_BINARY || opt == O_SGA) {
+            if (!us[opt]) { us[opt] = 1; tn_cmd(WILL, opt); }
+            if (opt == O_NAWS) tn_naws();
+        } else tn_cmd(WONT, opt);
+        break;
+    case DONT:
+        if (us[opt]) { us[opt] = 0; tn_cmd(WONT, opt); }
+        break;
+    case WILL:                  /* the server offers */
+        if (opt == O_ECHO || opt == O_SGA || opt == O_BINARY) {
+            if (!them[opt]) { them[opt] = 1; tn_cmd(DO, opt); }
+        } else tn_cmd(DONT, opt);
+        break;
+    case WONT:
+        if (them[opt]) { them[opt] = 0; tn_cmd(DONT, opt); }
+        break;
+    }
+}
+
+static void tn_sb(void)
+{
+    if (sblen >= 2 && sbbuf[0] == O_TTYPE && sbbuf[1] == 1) {      /* TTYPE SEND -> IS "ANSI" */
+        static const UBYTE is[] = { IAC, SB, O_TTYPE, 0, 'A', 'N', 'S', 'I', IAC, SE };
+        int i;
+        for (i = 0; i < (int)sizeof(is); i++) ob_put(is[i]);
+    }
+}
+
+static void tn_byte(UBYTE c)
+{
+    switch (tstate) {
+    case T_DATA:
+        if (c == IAC) tstate = T_IAC;
+        else data_byte(c);
+        break;
+    case T_IAC:
+        tstate = T_DATA;
+        if (c == IAC) data_byte(IAC);
+        else if (c >= WILL && c <= DONT) { tverb = c; tstate = T_OPT; }
+        else if (c == SB) { sblen = 0; tstate = T_SB; }
+        break;                  /* NOP, GA, AYT...: nothing */
+    case T_OPT:
+        tn_option(tverb, c);
+        tstate = T_DATA;
+        break;
+    case T_SB:
+        if (c == IAC) tstate = T_SBIAC;
+        else if (sblen < (int)sizeof(sbbuf)) sbbuf[sblen++] = c;
+        break;
+    case T_SBIAC:
+        if (c == SE) { tn_sb(); tstate = T_DATA; }
+        else { if (sblen < (int)sizeof(sbbuf)) sbbuf[sblen++] = c; tstate = T_SB; }
+        break;
+    }
+}
+
+/* ---- keyboard --------------------------------------------------------------------------- */
+/* Latin-1 0xA0-0xFF (what the Amiga keymap gives) -> CP437 (what the BBS thinks in) */
+static const UBYTE lat2cp[96] = {
+    0x20,0xAD,0x9B,0x9C,0x3F,0x9D,0x3F,0x3F,0x3F,0x3F,0xA6,0xAE,0xAA,0x3F,0x3F,0x3F,
+    0xF8,0xF1,0xFD,0x3F,0x3F,0xE6,0x3F,0xFA,0x3F,0x3F,0xA7,0xAF,0xAC,0xAB,0x3F,0xA8,
+    0x3F,0x3F,0x3F,0x3F,0x8E,0x8F,0x92,0x80,0x3F,0x90,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,
+    0x3F,0xA5,0x3F,0x3F,0x3F,0x3F,0x99,0x3F,0x3F,0x3F,0x3F,0x3F,0x9A,0x3F,0x3F,0xE1,
+    0x85,0xA0,0x83,0x3F,0x84,0x86,0x91,0x87,0x8A,0x82,0x88,0x89,0x8D,0xA1,0x8C,0x8B,
+    0x3F,0xA4,0x95,0xA2,0x93,0x3F,0x94,0xF6,0x3F,0x97,0xA3,0x96,0x81,0x3F,0x3F,0x98
+};
+
+static void about(void)
+{
+    struct EasyStruct es = {
+        sizeof(struct EasyStruct), 0, (UBYTE *)"About NilTerm",
+        (UBYTE *)"NilTerm " BBS_VERSION " - an ANSI telnet client for the Amiga\n"
+                 "Connected to %s port %ld  (%s)\n\n"
+                 "Font: IBM VGA 8x16 from The Ultimate Oldschool PC Font Pack\n"
+                 "by VileR, https://int10h.org/oldschool-pc-fonts/  (CC BY-SA 4.0)\n\n"
+                 "Alt+D  dialing directory      Alt+H  hang up\n"
+                 "Alt+B  scrollback             Alt+L  capture to a file (on/off)\n"
+                 "Alt+U  upload (Z/Y/XMODEM)    Alt+R  receive (Z/Y/XMODEM)\n"
+                 "Alt+S  settings (folders, ZMODEM auto-start)\n"
+                 "ZMODEM downloads start by themselves; Esc cancels a transfer\n"
+                 "Amiga+C  copy the screen      Amiga+V  paste\n"
+                 "Alt+X / Amiga+Q  exit         Help  this\n\n"
+                 "Arrows; Shift+Up/Down = PgUp/PgDn; Shift+Left/Right = Home/End.",
+        (UBYTE *)"OK"
+    };
+    extern char host_name[];
+    extern LONG host_port;
+    ULONG args[3];
+    args[0] = (ULONG)host_name; args[1] = (ULONG)host_port; args[2] = (ULONG)modename;
+    EasyRequestArgs(win, &es, NULL, (APTR)args);
+}
+
+static BOOL quit;
+/* hotkeys the session loop acts on (key() only records them) */
+enum { ACT_NONE, ACT_DIR, ACT_HANGUP, ACT_BACK, ACT_LOG, ACT_UPLOAD, ACT_RECV, ACT_SET, ACT_COPY, ACT_PASTE };
+static int action;
+static int watch_node;          /* WATCH=n: show node n's caller's screen (read-only) instead of logging on */
+
+static void send_key_str(const char *s) { ob_str(s); ob_flush(); }
+
+static void local_echo(const UBYTE *p, int n)
+{
+    if (them[O_ECHO]) return;           /* the BBS echoes (it always does) */
+    cursor_hide();
+    term_write(p, n);
+    flush();
+}
+
+static void key(struct IntuiMessage *m, UWORD code, UWORD qual, APTR prev)
+{
+    BOOL shift = (qual & (IEQUALIFIER_LSHIFT | IEQUALIFIER_RSHIFT)) != 0;
+    BOOL amigakey = (qual & (IEQUALIFIER_LCOMMAND | IEQUALIFIER_RCOMMAND)) != 0;
+    struct InputEvent ie;
+    UBYTE buf[16];
+    LONG n, i;
+
+    if (code & IECODE_UP_PREFIX) return;
+    if (!watch_node && (qual & (IEQUALIFIER_LALT | IEQUALIFIER_RALT)) && !amigakey) {
+        switch (code) {                 /* raw key positions, whatever the keymap */
+        case 0x22: action = ACT_DIR; return;        /* D */
+        case 0x25: action = ACT_HANGUP; return;     /* H */
+        case 0x32: quit = TRUE; return;             /* X */
+        case 0x35: action = ACT_BACK; return;       /* B */
+        case 0x28: action = ACT_LOG; return;        /* L */
+        case 0x16: action = ACT_UPLOAD; return;     /* U */
+        case 0x13: action = ACT_RECV; return;       /* R */
+        case 0x21: action = ACT_SET; return;        /* S */
+        }
+    }
+    if (!watch_node && amigakey) {
+        if (code == 0x33) { action = ACT_COPY; return; }    /* Amiga+C */
+        if (code == 0x34) { action = ACT_PASTE; return; }   /* Amiga+V */
+    }
+    if (watch_node) {                   /* watching: nothing goes to the caller - Esc/Q quit */
+        if (code == 0x45 || code == 0x10) quit = TRUE;
+        else if (code == 0x5F) about();
+        return;
+    }
+    switch (code) {
+    case 0x4C: send_key_str(shift ? "\x1b[5~" : "\x1b[A"); return;     /* up    (PgUp) */
+    case 0x4D: send_key_str(shift ? "\x1b[6~" : "\x1b[B"); return;     /* down  (PgDn) */
+    case 0x4E: send_key_str(shift ? "\x1b[K" : "\x1b[C"); return;      /* right (End)  */
+    case 0x4F: send_key_str(shift ? "\x1b[H" : "\x1b[D"); return;      /* left  (Home) */
+    case 0x46: send_key_str("\x1b[3~"); return;                        /* Del */
+    case 0x47: send_key_str("\x1b[2~"); return;                        /* Insert (PC keyboard) */
+    case 0x48: send_key_str("\x1b[5~"); return;                        /* Page Up */
+    case 0x49: send_key_str("\x1b[6~"); return;                        /* Page Down */
+    case 0x70: send_key_str("\x1b[H"); return;                         /* Home */
+    case 0x71: send_key_str("\x1b[K"); return;                         /* End (as SyncTERM sends it) */
+    case 0x5F: about(); return;                                        /* Help */
+    case 0x41: if (amigakey) return; buf[0] = 8; ob_put(8); ob_flush(); local_echo(buf, 1); return;
+    case 0x43: case 0x44: if (amigakey) return; ob_put('\r'); ob_flush(); buf[0] = '\r'; buf[1] = '\n'; local_echo(buf, 2); return;
+    }
+    ie.ie_NextEvent = NULL;
+    ie.ie_Class = IECLASS_RAWKEY;
+    ie.ie_SubClass = 0;
+    ie.ie_Code = code;
+    ie.ie_Qualifier = qual & ~(IEQUALIFIER_LCOMMAND | IEQUALIFIER_RCOMMAND);  /* Amiga-Q: the plain letter */
+    ie.ie_EventAddress = prev;
+    n = MapRawKey(&ie, (STRPTR)buf, sizeof(buf), NULL);
+    if (n <= 0) return;
+    if (amigakey) {
+        if (n == 1 && (buf[0] == 'q' || buf[0] == 'Q')) quit = TRUE;
+        return;                         /* other Amiga-key combinations are the system's */
+    }
+    if (buf[0] == 0x9B) return;         /* F-keys etc.: CSI sequences we don't pass on */
+    for (i = 0; i < n; i++) {
+        UBYTE c = buf[i];
+        if (c >= 0xA0) c = lat2cp[c - 0xA0];
+        else if (c >= 0x80) continue;
+        buf[i] = c;
+        ob_data(c);
+    }
+    ob_flush();
+    local_echo(buf, n);
+}
+
+static void handle_idcmp(void)
+{
+    struct IntuiMessage *m;
+    while ((m = (struct IntuiMessage *)GetMsg(win->UserPort))) {
+        ULONG cls = m->Class;
+        UWORD code = m->Code, qual = m->Qualifier;
+        APTR prev = m->IAddress ? *(APTR *)m->IAddress : NULL;
+        if (cls == IDCMP_REFRESHWINDOW) { BeginRefresh(win); EndRefresh(win, TRUE); }
+        ReplyMsg((struct Message *)m);
+        if (cls == IDCMP_RAWKEY) key(NULL, code, qual, prev);
+        if (closed || quit) break;
+    }
+}
+
+/* ---- the screen: mode, font, open/close ---------------------------------------------------- */
+static BOOL mode_fits(ULONG id, int w, int h, BOOL bounded)
+{
+    struct DimensionInfo dim;
+    int nw, nh;
+    if (id == INVALID_ID || ModeNotAvailable(id)) return FALSE;
+    if (!GetDisplayInfoData(NULL, (UBYTE *)&dim, sizeof(dim), DTAG_DIMS, id)) return FALSE;
+    nw = dim.Nominal.MaxX - dim.Nominal.MinX + 1;
+    nh = dim.Nominal.MaxY - dim.Nominal.MinY + 1;
+    if (dim.MaxDepth < 4 || nw < w || nh < h) return FALSE;
+    if (bounded && (nw > 800 || nh > 600)) return FALSE;   /* a 1024x768 card mode: rather lace */
+    return TRUE;
+}
+
+static BOOL make_font(void)
+{
+    int c, r;
+    if (!(strip = AllocVec(256 * CH, MEMF_CHIP | MEMF_CLEAR))) return FALSE;
+    for (c = 0; c < 256; c++)
+        for (r = 0; r < CH; r++)
+            strip[r * 256 + c] = CH == 16 ? nilfont[c][r] : (nilfont[c][2 * r] | nilfont[c][2 * r + 1]);
+    for (c = 0; c < 256; c++) charloc[c] = ((ULONG)(c * 8) << 16) | 8;
+    charloc[256] = charloc['?'];
+    memset(&vfont, 0, sizeof(vfont));
+    vfont.tf_Message.mn_Node.ln_Name = (char *)"nilterm.font";
+    vfont.tf_Message.mn_Node.ln_Type = NT_FONT;
+    vfont.tf_YSize = CH;
+    vfont.tf_Style = FS_NORMAL;
+    vfont.tf_Flags = FPF_DESIGNED;
+    vfont.tf_XSize = 8;
+    vfont.tf_Baseline = CH == 16 ? 12 : 6;
+    vfont.tf_BoldSmear = 1;
+    vfont.tf_Accessors = 1;
+    vfont.tf_LoChar = 0;
+    vfont.tf_HiChar = 255;
+    vfont.tf_CharData = strip;
+    vfont.tf_Modulo = 256;
+    vfont.tf_CharLoc = charloc;
+    return TRUE;
+}
+
+static BOOL try_open(ULONG id, int ch)
+{
+    static ULONG colors[16 * 3 + 2];
+    static UWORD pens[] = { 0, 15, 0, 15, 8, 4, 15, 7, 15, 0, 7, 0, (UWORD)~0 };
+    int i;
+    colors[0] = (16UL << 16) | 0;
+    for (i = 0; i < 16; i++) {
+        colors[1 + i * 3]     = vga[i][0] * 0x01010101UL;
+        colors[1 + i * 3 + 1] = vga[i][1] * 0x01010101UL;
+        colors[1 + i * 3 + 2] = vga[i][2] * 0x01010101UL;
+    }
+    colors[1 + 48] = 0;
+    scr = OpenScreenTags(NULL,
+        SA_DisplayID, id,
+        SA_Width, COLS * 8, SA_Height, SROWS * ch, SA_Depth, 4,
+        SA_Type, CUSTOMSCREEN, SA_Quiet, TRUE, SA_ShowTitle, FALSE,
+        SA_Title, (ULONG)"NilTerm",
+        SA_Colors32, (ULONG)colors,
+        SA_Pens, (ULONG)pens,
+        SA_Interleaved, TRUE,
+        SA_AutoScroll, TRUE,
+        TAG_END);
+    if (!scr) return FALSE;
+    CH = ch;
+    modeid = id;
+    {
+        struct NameInfo ni;
+        if (GetDisplayInfoData(NULL, (UBYTE *)&ni, sizeof(ni), DTAG_NAME, id))
+            strncpy(modename, (char *)ni.Name, DISPLAYNAMELEN);
+        else sprintf(modename, "mode 0x%08lx", id);
+    }
+    return TRUE;
+}
+
+static BOOL open_screen(ULONG want_id, BOOL native, BOOL small)
+{
+    static const ULONG lace[] = { DEFAULT_MONITOR_ID | HIRESLACE_KEY, PAL_MONITOR_ID | HIRESLACE_KEY,
+                                  NTSC_MONITOR_ID | HIRESLACE_KEY };
+    static const ULONG hires[] = { DEFAULT_MONITOR_ID | HIRES_KEY, PAL_MONITOR_ID | HIRES_KEY,
+                                   NTSC_MONITOR_ID | HIRES_KEY };
+    ULONG id;
+    int i;
+
+    if (want_id != INVALID_ID) {
+        if (mode_fits(want_id, 640, 400, FALSE) && try_open(want_id, 16)) return TRUE;
+        if (mode_fits(want_id, 640, 200, FALSE) && try_open(want_id, 8)) return TRUE;
+    }
+    if (!small) {
+        if (!native) {
+            id = BestModeID(BIDTAG_NominalWidth, 640, BIDTAG_NominalHeight, 400,
+                            BIDTAG_DesiredWidth, 640, BIDTAG_DesiredHeight, 400,
+                            BIDTAG_Depth, 4, TAG_END);
+            if (mode_fits(id, 640, 400, TRUE) && try_open(id, 16)) return TRUE;
+        }
+        for (i = 0; i < 3; i++)
+            if (mode_fits(lace[i], 640, 400, FALSE) && try_open(lace[i], 16)) return TRUE;
+    }
+    /* no 400-line mode: 640x200, half-height glyphs */
+    if (!native && !small) {
+        id = BestModeID(BIDTAG_NominalWidth, 640, BIDTAG_NominalHeight, 200,
+                        BIDTAG_DesiredWidth, 640, BIDTAG_DesiredHeight, 200, BIDTAG_Depth, 4, TAG_END);
+        if (mode_fits(id, 640, 200, TRUE) && try_open(id, 8)) return TRUE;
+    }
+    for (i = 0; i < 3; i++)
+        if (mode_fits(hires[i], 640, 200, FALSE) && try_open(hires[i], 8)) return TRUE;
+    return FALSE;
+}
+
+/* ---- main ------------------------------------------------------------------------------ */
+char host_name[128] = "127.0.0.1";
+LONG host_port = 0;                         /* 0 = find it: the running NilBBS, then NilBBS.cfg, then 2323 */
+static ULONG arg_modeid = INVALID_ID;
+static BOOL arg_native, arg_small, from_cli;
+
+static void say(const char *s) { if (from_cli) { PutStr((STRPTR)s); Flush(Output()); } }
+
+static BOOL connect_host(void)
+{
+    struct sockaddr_in sa;
+    char msg[200];
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((UWORD)host_port);
+    sa.sin_addr.s_addr = inet_addr((STRPTR)host_name);
+    if (sa.sin_addr.s_addr == (ULONG)-1) {
+        struct hostent *he = gethostbyname((STRPTR)host_name);
+        if (!he) {
+            sprintf(msg, "\x1b[1;31mNilTerm: can't find host %s\x1b[0m\r\n", host_name);
+            term_str(msg);
+            return FALSE;
+        }
+        memcpy(&sa.sin_addr, he->h_addr, 4);
+    }
+    if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) return FALSE;
+    if (connect(sock, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+        sprintf(msg, "\x1b[1;31mNilTerm: no answer from %s port %ld - is NilBBS running?\x1b[0m\r\n",
+                host_name, (long)host_port);
+        term_str(msg);
+        CloseSocket(sock); sock = -1;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static void wait_any_key(int secs);
+static void default_port(void);
+
+/* WATCH=n: the node copies everything it sends its caller to our public port
+ * NILBBS.WATCH.<n> (node/spy.c) - the last 4 KB first, so we start with the screen as it
+ * is.  The bytes are the telnet stream as sent, which tn_byte() already understands; our
+ * answers (cursor reports, telnet replies) go nowhere since there's no socket.  The caller
+ * is never told.  Esc / Q / Amiga-Q stop; so does the caller leaving. */
+static int watch_loop(void)
+{
+    struct BBSShared *S = shared_find();
+    struct MsgPort *port;
+    char name[32], msg[160];
+    int idle = 0, n = watch_node;
+    if (!S) { term_str("\x1b[1;31mNilTerm: NilBBS isn't running\x1b[0m\r\n"); wait_any_key(10); return RETURN_WARN; }
+    if (n < 1 || n > S->nodes || S->node[n - 1].state == NS_FREE) {
+        sprintf(msg, "\x1b[1;31mNilTerm: nobody on node %d\x1b[0m\r\n", n);
+        term_str(msg); wait_any_key(10); return RETURN_WARN;
+    }
+    sprintf(name, SPY_PORTFMT, n);
+    if (!(port = CreateMsgPort())) return RETURN_FAIL;
+    Forbid();
+    if (FindPort((STRPTR)name)) {
+        Permit(); DeleteMsgPort(port);
+        term_str("\x1b[1;31mNilTerm: that node is already being watched\x1b[0m\r\n"); wait_any_key(10);
+        return RETURN_WARN;
+    }
+    port->mp_Node.ln_Name = name;
+    port->mp_Node.ln_Pri = 0;
+    AddPort(port);
+    Permit();
+    bbs_log(BBS_SYSLOG, "NilTerm: sysop watching node %ld (%s)", (LONG)n,
+            S->node[n - 1].user[0] ? S->node[n - 1].user : "(logging in)");
+    S->node[n - 1].spy = 1;                     /* the node starts copying, history first */
+    while (!quit) {
+        ULONG mask = (1UL << port->mp_SigBit) | (1UL << win->UserPort->mp_SigBit) | SIGBREAKF_CTRL_C;
+        ULONG got = SetSignal(0, mask) & mask;  /* polled: the 0.2 s tick notices a caller who left */
+        struct SpyMsg *m;
+        if (got & SIGBREAKF_CTRL_C) break;
+        if (got & (1UL << win->UserPort->mp_SigBit)) handle_idcmp();
+        if ((m = (struct SpyMsg *)GetMsg(port))) {
+            cursor_hide();
+            beeped = FALSE;
+            do { LONG i; for (i = 0; i < m->len; i++) tn_byte(m->data[i]); FreeVec(m); }
+            while ((m = (struct SpyMsg *)GetMsg(port)));
+            obn = 0;                            /* replies meant for a socket: dropped */
+            flush();
+        }
+        if (S->node[n - 1].state == NS_FREE) {  /* ~0.6 s free: the caller has gone */
+            if (++idle > 2) break;
+        } else idle = 0;
+        if (!got) Delay(10);
+    }
+    S->node[n - 1].spy = 0;
+    Forbid();
+    RemPort(port);
+    Permit();
+    { struct Message *m; while ((m = GetMsg(port))) FreeVec(m); }
+    DeleteMsgPort(port);
+    if (S->node[n - 1].state == NS_FREE && !quit) {
+        term_str("\r\n\x1b[0;36m-- the caller has left --\x1b[0m\r\n");
+        flush();
+        Delay(100);
+    }
+    return RETURN_OK;
+}
+
+static void wait_any_key(int secs)
+{
+    /* show an error until a key is pressed (or a while passes) */
+    int ticks = secs * 10;
+    flush();
+    while (ticks-- > 0) {
+        struct IntuiMessage *m;
+        BOOL got = FALSE;
+        while ((m = (struct IntuiMessage *)GetMsg(win->UserPort))) {
+            if (m->Class == IDCMP_RAWKEY && !(m->Code & IECODE_UP_PREFIX)) got = TRUE;
+            ReplyMsg((struct Message *)m);
+        }
+        if (got || (SetSignal(0, 0) & SIGBREAKF_CTRL_C)) break;
+        Delay(5);
+    }
+}
+
+/* ---- the status bar (the 25th line, under an 80x24 terminal) ---------------------------------- */
+static BOOL statusbar;                  /* off in WATCH= mode: the node's own 25 lines fill the screen */
+static char st_name[48];                /* the system we're on, or what the directory is doing */
+static ULONG st_since;                  /* seconds, when the call started (0 = not online) */
+static char st_mode[64];                /* scrollback / transfer progress, shown instead of the clock */
+
+static ULONG now_secs(void)
+{
+    struct DateStamp ds;
+    DateStamp(&ds);
+    return (ULONG)ds.ds_Days * 86400 + ds.ds_Minute * 60 + ds.ds_Tick / TICKS_PER_SECOND;
+}
+
+static void status_draw(void)
+{
+    char line[COLS + 16], t[24];
+    int y = SROWS - 1, x, n;
+    if (!statusbar) return;
+    if (st_mode[0]) {                   /* a wider field: "BACK 23", transfer progress */
+        n = sprintf(line, " %-24.24s %.53s", st_name, st_mode);
+        goto fill;
+    }
+    if (st_since) {
+        ULONG s = now_secs() - st_since;
+        sprintf(t, "%02lu:%02lu:%02lu", (unsigned long)(s / 3600), (unsigned long)(s / 60 % 60), (unsigned long)(s % 60));
+    } else strcpy(t, "offline");
+    n = sprintf(line, " %-24.24s %-9s %3s  Alt: D-ir H-ang B-ack L-og U-p R-cv X",
+                st_name, t, cap_fh ? "LOG" : "   ");
+fill:
+    for (x = 0; x < COLS; x++) {
+        chr[y][x] = x < n ? (UBYTE)line[x] : ' ';
+        att[y][x] = 0x70;               /* black on grey, like SyncTERM's */
+    }
+    mark(y, 0, COLS - 1);
+}
+
+/* ---- keys for the menus (the directory, prompts, scrollback) -------------------------------- */
+#define K_UP    0x100
+#define K_DOWN  0x101
+#define K_PGUP  0x102
+#define K_PGDN  0x103
+#define K_HOME  0x104
+#define K_END   0x105
+#define K_ESC   27
+#define K_ENTER 13
+#define K_BS    8
+#define K_DEL   0x106
+#define K_HELP  0x107
+#define K_QUIT  0x108               /* Amiga+Q, Alt+X, CTRL-C */
+
+static int ui_key(void)
+{
+    for (;;) {
+        struct IntuiMessage *m;
+        while ((m = (struct IntuiMessage *)GetMsg(win->UserPort))) {
+            ULONG cls = m->Class;
+            UWORD code = m->Code, qual = m->Qualifier;
+            APTR prev = m->IAddress ? *(APTR *)m->IAddress : NULL;
+            BOOL shift = (qual & (IEQUALIFIER_LSHIFT | IEQUALIFIER_RSHIFT)) != 0;
+            BOOL amigak = (qual & (IEQUALIFIER_LCOMMAND | IEQUALIFIER_RCOMMAND)) != 0;
+            BOOL alt = (qual & (IEQUALIFIER_LALT | IEQUALIFIER_RALT)) != 0;
+            struct InputEvent ie;
+            UBYTE b[8];
+            LONG n;
+            if (cls == IDCMP_REFRESHWINDOW) { BeginRefresh(win); EndRefresh(win, TRUE); }
+            ReplyMsg((struct Message *)m);
+            if (cls != IDCMP_RAWKEY || (code & IECODE_UP_PREFIX)) continue;
+            switch (code) {
+            case 0x4C: return shift ? K_PGUP : K_UP;
+            case 0x4D: return shift ? K_PGDN : K_DOWN;
+            case 0x48: return K_PGUP;
+            case 0x49: return K_PGDN;
+            case 0x70: return K_HOME;
+            case 0x71: return K_END;
+            case 0x45: return K_ESC;
+            case 0x43: case 0x44: return K_ENTER;
+            case 0x41: return K_BS;
+            case 0x46: return K_DEL;
+            case 0x5F: return K_HELP;
+            }
+            if (alt && code == 0x32) return K_QUIT;             /* Alt+X */
+            ie.ie_NextEvent = NULL; ie.ie_Class = IECLASS_RAWKEY; ie.ie_SubClass = 0;
+            ie.ie_Code = code; ie.ie_Qualifier = qual & ~(IEQUALIFIER_LCOMMAND | IEQUALIFIER_RCOMMAND);
+            ie.ie_EventAddress = prev;
+            n = MapRawKey(&ie, (STRPTR)b, sizeof(b), NULL);
+            if (n != 1) continue;
+            if (amigak) { if (b[0] == 'q' || b[0] == 'Q') return K_QUIT; continue; }
+            if (b[0] >= 0x20 && b[0] != 0x7F && b[0] != 0x9B) return b[0];
+        }
+        if (Wait((1UL << win->UserPort->mp_SigBit) | SIGBREAKF_CTRL_C) & SIGBREAKF_CTRL_C) return K_QUIT;
+    }
+}
+
+/* write a line of text at (x,y) in one attribute, straight into the cells */
+static void put_at(int y, int x, UBYTE a, const char *s, int width)
+{
+    int i;
+    for (i = 0; i < width && x + i < COLS; i++) {
+        chr[y][x + i] = *s ? (UBYTE)*s++ : ' ';
+        att[y][x + i] = a;
+    }
+    mark(y, x, x + i - 1);
+}
+
+/* a one-line editor on row y: returns FALSE on Esc (buf left as it was) */
+static BOOL edit_line(int y, const char *prompt, char *buf, int max)
+{
+    char w[128];
+    int len, pl = strlen(prompt), k;
+    strncpy(w, buf, sizeof(w) - 1); w[sizeof(w) - 1] = 0;
+    if (max > (int)sizeof(w) - 1) max = sizeof(w) - 1;
+    if (max > COLS - pl - 3) max = COLS - pl - 3;
+    len = strlen(w); if (len > max) { len = max; w[len] = 0; }
+    for (;;) {
+        put_at(y, 0, 0x0F, "", COLS);
+        put_at(y, 1, 0x0B, prompt, pl);
+        put_at(y, pl + 2, 0x4F, w, max + 1);
+        cursor_hide();
+        cx = pl + 2 + len; cy = y;
+        curvis = TRUE;
+        status_draw();
+        flush();
+        k = ui_key();
+        if (k == K_ESC || k == K_QUIT) { put_at(y, 0, 0x07, "", COLS); cursor_hide(); flush(); return FALSE; }
+        if (k == K_ENTER) break;
+        if (k == K_BS) { if (len > 0) w[--len] = 0; continue; }
+        if (k >= 0x20 && k < 0x100 && len < max) { w[len++] = (char)k; w[len] = 0; }
+    }
+    put_at(y, 0, 0x07, "", COLS);
+    cursor_hide();
+    flush();
+    strcpy(buf, w);
+    return TRUE;
+}
+
+/* ---- scrollback viewer (Alt+B): the saved lines, then the screen as it is ------------------- */
+static void draw_row_from(int y, const UBYTE *c, const UBYTE *a)
+{
+    memcpy(chr[y], c, COLS);
+    memcpy(att[y], a, COLS);
+    mark(y, 0, COLS - 1);
+}
+
+static void scrollback(void)
+{
+    static UBYTE sc[SROWS][COLS], sa[SROWS][COLS];      /* the live screen, put back afterwards */
+    int total, top, y, k, oldx = cx, oldy = cy;
+    BOOL oldvis = curvis;
+    memcpy(sc, chr, sizeof(sc)); memcpy(sa, att, sizeof(sa));
+    total = sb_count + ROWS;
+    top = sb_count;                                    /* first shown line: the screen itself */
+    if (!sb_count) { DisplayBeep(scr); return; }
+    cursor_hide();
+    curvis = FALSE;
+    for (;;) {
+        for (y = 0; y < ROWS; y++) {
+            int l = top + y;
+            if (l < sb_count) {
+                int slot = (sb_head - sb_count + l + SBMAX) % SBMAX;
+                draw_row_from(y, sb_chr + slot * COLS, sb_att + slot * COLS);
+            } else draw_row_from(y, sc[l - sb_count], sa[l - sb_count]);
+        }
+        sprintf(st_mode, "BACK %d", sb_count - top > 0 ? sb_count - top : 0);
+        status_draw();
+        flush();
+        k = ui_key();
+        if (k == K_UP) top--;
+        else if (k == K_DOWN) top++;
+        else if (k == K_PGUP) top -= ROWS - 1;
+        else if (k == K_PGDN) top += ROWS - 1;
+        else if (k == K_HOME) top = 0;
+        else if (k == K_END) top = sb_count;
+        else break;                                    /* Esc, Enter, anything else: back */
+        if (top < 0) top = 0;
+        if (top > total - ROWS) top = total - ROWS;
+    }
+    memcpy(chr, sc, sizeof(sc)); memcpy(att, sa, sizeof(sa));
+    for (y = 0; y < SROWS; y++) mark(y, 0, COLS - 1);
+    st_mode[0] = 0;
+    cx = oldx; cy = oldy; curvis = oldvis;
+    status_draw();
+    flush();
+}
+
+/* ---- a file requester (asl.library) ----------------------------------------------------- */
+static BOOL ask_file(const char *title, char *path, int max, BOOL save)
+{
+    struct FileRequester *fr;
+    BOOL ok = FALSE;
+    char drawer[200], *file;
+    if (!AslBase) return FALSE;
+    strncpy(drawer, path, sizeof(drawer) - 1); drawer[sizeof(drawer) - 1] = 0;
+    file = (char *)FilePart((STRPTR)drawer);
+    {   char f[64];
+        strncpy(f, file, sizeof(f) - 1); f[sizeof(f) - 1] = 0;
+        *PathPart((STRPTR)drawer) = 0;
+        fr = AllocAslRequestTags(ASL_FileRequest,
+                ASLFR_Window, (ULONG)win, ASLFR_TitleText, (ULONG)title,
+                ASLFR_InitialDrawer, (ULONG)drawer, ASLFR_InitialFile, (ULONG)f,
+                ASLFR_DoSaveMode, save, ASLFR_SleepWindow, TRUE, TAG_END);
+    }
+    if (!fr) return FALSE;
+    if (AslRequest(fr, NULL) && fr->fr_File[0]) {
+        strncpy(path, (char *)fr->fr_Drawer, max - 1); path[max - 1] = 0;
+        AddPart((STRPTR)path, fr->fr_File, max);
+        ok = TRUE;
+    }
+    FreeAslRequest(fr);
+    return ok;
+}
+
+/* a drawer requester (asl.library): TRUE and the drawer in `dir` if one was picked */
+static BOOL ask_drawer(const char *title, char *dir, int max)
+{
+    struct FileRequester *fr;
+    BOOL ok = FALSE;
+    if (!AslBase) return FALSE;
+    if (!(fr = AllocAslRequestTags(ASL_FileRequest, ASLFR_Window, (ULONG)win,
+            ASLFR_TitleText, (ULONG)title, ASLFR_DrawersOnly, TRUE,
+            ASLFR_InitialDrawer, (ULONG)(dir[0] ? dir : "RAM:"), ASLFR_SleepWindow, TRUE, TAG_END))) return FALSE;
+    if (AslRequest(fr, NULL)) {
+        strncpy(dir, (char *)fr->fr_Drawer, max - 1); dir[max - 1] = 0;
+        if (!dir[0]) strcpy(dir, "RAM:");
+        ok = TRUE;
+    }
+    FreeAslRequest(fr);
+    return ok;
+}
+
+/* ---- settings: ENVARC:NilTerm.prefs ---------------------------------------------------------- */
+#define PREFS_FILE "ENVARC:NilTerm.prefs"
+static struct {
+    char dl[200];                       /* downloads go here (an entry's own folder wins); "" = ask once */
+    char ul[200];                       /* the upload requester starts here */
+    char cap[200];                      /* capture files go here */
+    BOOL autozm;                        /* start ZMODEM downloads by themselves */
+} prefs;
+
+static void prefs_save(void)
+{
+    BPTR fh;
+    char l[260];
+    if (!(fh = Open((STRPTR)PREFS_FILE, MODE_NEWFILE))) return;
+    FPuts(fh, (STRPTR)"; NilTerm settings (Settings: S in the dialing directory, Alt+S during a call)\n");
+    sprintf(l, "download=%s\nupload=%s\ncapture=%s\nautozmodem=%s\n",
+            prefs.dl, prefs.ul, prefs.cap, prefs.autozm ? "yes" : "no");
+    FPuts(fh, (STRPTR)l);
+    Close(fh);
+}
+
+static void prefs_load(void)
+{
+    BPTR fh;
+    char l[260];
+    strcpy(prefs.ul, "RAM:");
+    strcpy(prefs.cap, "RAM:");
+    prefs.autozm = TRUE;
+    if ((fh = Open((STRPTR)PREFS_FILE, MODE_OLDFILE))) {
+        while (FGets(fh, (STRPTR)l, sizeof(l))) {
+            char *e = l + strlen(l);
+            while (e > l && (e[-1] == '\n' || e[-1] == '\r')) *--e = 0;
+            if (!strncmp(l, "download=", 9)) strncpy(prefs.dl, l + 9, sizeof(prefs.dl) - 1);
+            else if (!strncmp(l, "upload=", 7) && l[7]) strncpy(prefs.ul, l + 7, sizeof(prefs.ul) - 1);
+            else if (!strncmp(l, "capture=", 8) && l[8]) strncpy(prefs.cap, l + 8, sizeof(prefs.cap) - 1);
+            else if (!strncmp(l, "autozmodem=", 11)) prefs.autozm = (l[11] == 'y' || l[11] == 'Y');
+        }
+        Close(fh);
+    } else if (GetVar((STRPTR)"NilTerm/DownloadDir", (STRPTR)prefs.dl, sizeof(prefs.dl), GVF_GLOBAL_ONLY) > 0)
+        prefs_save();                   /* the first builds kept the download folder in an ENV variable */
+}
+
+/* ---- capture on / off (Alt+L) --------------------------------------------------------------- */
+static void capture_toggle(void)
+{
+    static char path[256] = "RAM:NilTerm.cap";
+    struct EasyStruct es = { sizeof(struct EasyStruct), 0, (UBYTE *)"NilTerm capture",
+        (UBYTE *)"Log this session to a file:\nRaw ANSI keeps the colours (view it in NilTerm or SyncTERM),\n"
+                 "Plain text keeps only the words.", (UBYTE *)"Raw ANSI|Plain text|Cancel" };
+    LONG r;
+    if (cap_fh) {
+        cap_flush(); Close(cap_fh); cap_fh = 0;
+        status_draw(); flush();
+        return;
+    }
+    r = EasyRequestArgs(win, &es, NULL, NULL);
+    if (r == 0) return;
+    cap_plain = (r == 2);
+    if (!strcmp(path, "RAM:NilTerm.cap") && prefs.cap[0]) path_join(path, prefs.cap, "NilTerm.cap");
+    if (!ask_file(cap_plain ? "Capture to a text file" : "Capture to an ANSI file", path, sizeof(path), TRUE)) return;
+    if ((cap_fh = Open((STRPTR)path, MODE_READWRITE))) {
+        Seek(cap_fh, 0, OFFSET_END);            /* an existing log grows, like SyncTERM's */
+        cap_n = 0; cap_esc = 0;
+    } else DisplayBeep(scr);
+    status_draw(); flush();
+}
+
+/* ---- the clipboard: Amiga+C copies the screen, Amiga+V pastes -------------------------------- */
+static UBYTE cp2lat[128];               /* CP437 0x80-0xFF -> Latin-1 (the reverse of lat2cp), '?' if none */
+
+static void make_cp2lat(void)
+{
+    int i;
+    for (i = 0; i < 128; i++) cp2lat[i] = '?';
+    for (i = 0; i < 96; i++) if (lat2cp[i] >= 0x80) cp2lat[lat2cp[i] - 0x80] = (UBYTE)(0xA0 + i);
+    /* box drawing and blocks: the nearest ASCII */
+    for (i = 0xB3; i <= 0xDA; i++) cp2lat[i - 0x80] = '+';
+    cp2lat[0xB3 - 0x80] = cp2lat[0xBA - 0x80] = '|';
+    cp2lat[0xC4 - 0x80] = cp2lat[0xCD - 0x80] = '-';
+    for (i = 0xB0; i <= 0xB2; i++) cp2lat[i - 0x80] = '#';
+    for (i = 0xDB; i <= 0xDF; i++) cp2lat[i - 0x80] = '#';
+}
+
+static void clip_copy(void)
+{
+    struct IFFHandle *iff;
+    static char text[SROWS * (COLS + 1)];
+    int y, x, n = 0;
+    if (!IFFParseBase) { DisplayBeep(scr); return; }
+    for (y = 0; y < ROWS; y++) {
+        int e = COLS - 1;
+        while (e >= 0 && chr[y][e] == ' ') e--;
+        for (x = 0; x <= e; x++) {
+            UBYTE c = chr[y][x];
+            text[n++] = c >= 0x80 ? cp2lat[c - 0x80] : c < 0x20 ? ' ' : c;
+        }
+        text[n++] = '\n';
+    }
+    while (n > 1 && text[n - 1] == '\n' && text[n - 2] == '\n') n--;   /* no trail of blank lines */
+    if (!(iff = AllocIFF())) return;
+    if ((iff->iff_Stream = (ULONG)OpenClipboard(0))) {
+        InitIFFasClip(iff);
+        if (!OpenIFF(iff, IFFF_WRITE)) {
+            if (!PushChunk(iff, MAKE_ID('F','T','X','T'), ID_FORM, IFFSIZE_UNKNOWN)) {
+                if (!PushChunk(iff, 0, MAKE_ID('C','H','R','S'), IFFSIZE_UNKNOWN)) {
+                    WriteChunkBytes(iff, text, n);
+                    PopChunk(iff);
+                }
+                PopChunk(iff);
+            }
+            CloseIFF(iff);
+        }
+        CloseClipboard((struct ClipboardHandle *)iff->iff_Stream);
+    }
+    FreeIFF(iff);
+    DisplayBeep(scr);                   /* "copied" */
+}
+
+static void clip_paste(void)
+{
+    struct IFFHandle *iff;
+    if (!IFFParseBase || sock < 0) return;
+    if (!(iff = AllocIFF())) return;
+    if ((iff->iff_Stream = (ULONG)OpenClipboard(0))) {
+        InitIFFasClip(iff);
+        if (!OpenIFF(iff, IFFF_READ)) {
+            if (!StopChunk(iff, MAKE_ID('F','T','X','T'), MAKE_ID('C','H','R','S'))) {
+                while (!ParseIFF(iff, IFFPARSE_SCAN)) {
+                    UBYTE b[256];
+                    LONG got, i;
+                    while ((got = ReadChunkBytes(iff, b, sizeof(b))) > 0)
+                        for (i = 0; i < got; i++) {
+                            UBYTE c = b[i];
+                            if (c == '\n') c = '\r';
+                            else if (c >= 0xA0) c = lat2cp[c - 0xA0];
+                            else if (c < 0x20 && c != '\t' && c != '\r') continue;
+                            else if (c >= 0x7F && c < 0xA0) continue;
+                            ob_data(c);
+                        }
+                }
+            }
+            CloseIFF(iff);
+        }
+        CloseClipboard((struct ClipboardHandle *)iff->iff_Stream);
+    }
+    FreeIFF(iff);
+    ob_flush();
+}
+
+/* ---- the dialing directory: ENVARC:NilTerm.lst ------------------------------------------------ */
+#define DIR_FILE "ENVARC:NilTerm.lst"
+#define DIR_MAX  100
+struct DirEnt {
+    char name[40];
+    char host[64];
+    LONG port;                          /* 0 = this Amiga's NilBBS, whatever port it's on */
+    LONG calls;
+    char last[20];                      /* "28-Sep-26 14:22" */
+    char dl[128];                       /* its own download folder, "" = the Settings one */
+};
+static struct DirEnt *cur_ent;          /* the entry being called (NULL: HOST=/PORT= direct mode) */
+static void settings(void);
+static struct DirEnt *dir;
+static int ndir;
+
+static void dir_save(void)
+{
+    BPTR fh;
+    int i;
+    char l[300];
+    if (!(fh = Open((STRPTR)DIR_FILE, MODE_NEWFILE))) return;
+    FPuts(fh, (STRPTR)"; NilTerm dialing directory - [name], then host / port / calls / last\n");
+    for (i = 0; i < ndir; i++) {
+        sprintf(l, "\n[%s]\nhost=%s\nport=%ld\ncalls=%ld\nlast=%s\n",
+                dir[i].name, dir[i].host, (long)dir[i].port, (long)dir[i].calls, dir[i].last);
+        FPuts(fh, (STRPTR)l);
+        if (dir[i].dl[0]) { sprintf(l, "download=%s\n", dir[i].dl); FPuts(fh, (STRPTR)l); }
+    }
+    Close(fh);
+}
+
+static void dir_load(void)
+{
+    BPTR fh;
+    char l[200];
+    ndir = 0;
+    if ((fh = Open((STRPTR)DIR_FILE, MODE_OLDFILE))) {
+        while (FGets(fh, (STRPTR)l, sizeof(l))) {
+            char *e = l + strlen(l);
+            while (e > l && (e[-1] == '\n' || e[-1] == '\r' || e[-1] == ' ')) *--e = 0;
+            if (l[0] == '[' && e > l + 1 && e[-1] == ']' && ndir < DIR_MAX) {
+                memset(&dir[ndir], 0, sizeof(dir[0]));
+                e[-1] = 0;
+                strncpy(dir[ndir].name, l + 1, sizeof(dir[0].name) - 1);
+                ndir++;
+            } else if (ndir) {
+                struct DirEnt *d = &dir[ndir - 1];
+                if (!strncmp(l, "host=", 5)) strncpy(d->host, l + 5, sizeof(d->host) - 1);
+                else if (!strncmp(l, "port=", 5)) d->port = atol(l + 5);
+                else if (!strncmp(l, "calls=", 6)) d->calls = atol(l + 6);
+                else if (!strncmp(l, "last=", 5)) strncpy(d->last, l + 5, sizeof(d->last) - 1);
+                else if (!strncmp(l, "download=", 9)) strncpy(d->dl, l + 9, sizeof(d->dl) - 1);
+            }
+        }
+        Close(fh);
+    }
+    if (!ndir) {                        /* first run: the BBS on this Amiga */
+        memset(&dir[0], 0, sizeof(dir[0]));
+        strcpy(dir[0].name, "This Amiga's NilBBS");
+        strcpy(dir[0].host, "127.0.0.1");
+        ndir = 1;
+        dir_save();
+    }
+}
+
+static void dir_stamp(struct DirEnt *d)
+{
+    struct DateTime dt;
+    char day[LEN_DATSTRING], tim[LEN_DATSTRING];
+    DateStamp(&dt.dat_Stamp);
+    dt.dat_Format = FORMAT_DOS; dt.dat_Flags = 0;
+    dt.dat_StrDay = NULL; dt.dat_StrDate = (STRPTR)day; dt.dat_StrTime = (STRPTR)tim;
+    DateToStr(&dt);
+    tim[5] = 0;                         /* hh:mm */
+    sprintf(d->last, "%s %s", day, tim);
+    d->calls++;
+}
+
+static void dir_draw(int sel, int first, int shown)
+{
+    char l[COLS + 8];
+    int i, y;
+    for (y = 0; y < ROWS; y++) put_at(y, 0, 0x07, "", COLS);
+    put_at(0, 0, 0x4F, "", COLS);
+    put_at(0, 2, 0x4F, "NilTerm  -  Dialing Directory", 40);
+    put_at(0, 59, 0x4B, "Help = keys & about", 20);
+    sprintf(l, " %-28s %-26s %5s  %s", "Name", "Address", "Calls", "Last call");
+    put_at(2, 0, 0x0E, l, COLS);
+    put_at(3, 0, 0x08, " -----------------------------------------------------------------------------", COLS);
+    for (i = 0; i < shown; i++) {
+        int n = first + i;
+        char addr[64];
+        if (n >= ndir) break;
+        if (dir[n].port) sprintf(addr, "%s:%ld", dir[n].host, (long)dir[n].port);
+        else sprintf(addr, "%s (local)", dir[n].host);
+        sprintf(l, " %-28.28s %-26.26s %5ld  %.15s", dir[n].name, addr, (long)dir[n].calls, dir[n].last);
+        put_at(4 + i, 0, n == sel ? 0x70 : 0x07, l, COLS);
+    }
+    if (!ndir) put_at(4, 1, 0x08, "(empty - A adds a system)", 40);
+    put_at(ROWS - 2, 0, 0x08, " -----------------------------------------------------------------------------", COLS);
+    put_at(ROWS - 1, 0, 0x0B,
+           " Enter call  A add  E edit  D delete  C quick connect  S settings  Q quit", COLS);
+    strcpy(st_name, "Dialing directory");
+    st_since = 0;
+    status_draw();
+    cursor_hide();
+    curvis = FALSE;
+    flush();
+}
+
+static BOOL dir_edit(struct DirEnt *d)
+{
+    char port[12];
+    struct DirEnt e = *d;
+    if (!edit_line(ROWS - 3, "Name:", e.name, sizeof(e.name) - 1) || !e.name[0]) return FALSE;
+    if (!edit_line(ROWS - 3, "Host (name or address):", e.host, sizeof(e.host) - 1) || !e.host[0]) return FALSE;
+    sprintf(port, "%ld", (long)(e.port ? e.port : 23));
+    if (!edit_line(ROWS - 3, "Port (0 = this Amiga's NilBBS):", port, 6)) return FALSE;
+    e.port = atol(port);
+    if (!edit_line(ROWS - 3, "Download folder (blank = Settings' one, ? = pick):", e.dl, sizeof(e.dl) - 1)) return FALSE;
+    if (!strcmp(e.dl, "?")) { e.dl[0] = 0; if (!ask_drawer("Downloads from this system go to", e.dl, sizeof(e.dl))) e.dl[0] = 0; }
+    *d = e;
+    return TRUE;
+}
+
+/* the directory: returns the entry to call (its host/port are set up), -1 = quit */
+static int directory(void)
+{
+    static int sel;
+    int first = 0, shown = ROWS - 7, k, i;
+    char q[80];
+    for (;;) {
+        if (sel >= ndir) sel = ndir - 1;
+        if (sel < 0) sel = 0;
+        if (sel < first) first = sel;
+        if (sel >= first + shown) first = sel - shown + 1;
+        dir_draw(sel, first, shown);
+        k = ui_key();
+        switch (k) {
+        case K_UP: sel--; break;
+        case K_DOWN: sel++; break;
+        case K_PGUP: sel -= shown; break;
+        case K_PGDN: sel += shown; break;
+        case K_HOME: sel = 0; break;
+        case K_END: sel = ndir - 1; break;
+        case K_HELP: about(); break;
+        case 's': case 'S': settings(); break;
+        case K_QUIT: case K_ESC: case 'q': case 'Q': return -1;
+        case K_ENTER:
+            if (ndir) return sel;
+            break;
+        case 'a': case 'A':
+            if (ndir < DIR_MAX) {
+                struct DirEnt d;
+                memset(&d, 0, sizeof(d));
+                if (dir_edit(&d)) { dir[ndir] = d; sel = ndir++; dir_save(); }
+            }
+            break;
+        case 'e': case 'E':
+            if (ndir && dir_edit(&dir[sel])) dir_save();
+            break;
+        case 'd': case 'D': case K_DEL:
+            if (ndir) {
+                char yn[4] = "";
+                sprintf(q, "Delete \"%.40s\"? (y/N)", dir[sel].name);
+                if (edit_line(ROWS - 3, q, yn, 1) && (yn[0] == 'y' || yn[0] == 'Y')) {
+                    for (i = sel; i + 1 < ndir; i++) dir[i] = dir[i + 1];
+                    ndir--;
+                    dir_save();
+                }
+            }
+            break;
+        case 'c': case 'C': {
+            char hp[80] = "";
+            if (edit_line(ROWS - 3, "Connect to host[:port]:", hp, 70) && hp[0] && ndir < DIR_MAX) {
+                char *c = strrchr(hp, ':');
+                struct DirEnt d;
+                memset(&d, 0, sizeof(d));
+                d.port = 23;
+                if (c) { *c = 0; d.port = atol(c + 1); }
+                strncpy(d.host, hp, sizeof(d.host) - 1);
+                strncpy(d.name, hp, sizeof(d.name) - 1);
+                /* a quick connect is remembered, like SyncTERM does - delete it if not wanted */
+                dir[ndir] = d; sel = ndir++;
+                dir_save();
+                return sel;
+            }
+            break;
+        }
+        }
+    }
+}
+
+/* ---- the Settings screen (S in the directory, Alt+S during a call) ------------------------------ */
+static void settings(void)
+{
+    static UBYTE sc[SROWS][COLS], sa[SROWS][COLS];      /* whatever was on screen, put back afterwards */
+    static const char *label[] = { "Download folder", "Upload folder", "Capture folder", "ZMODEM downloads" };
+    static const char *help[] = {
+        "Where downloads are saved - a directory entry's own folder wins over this one.",
+        "Where the upload file requester opens.",
+        "Where Alt+L capture files go.",
+        "Yes: a ZMODEM download starts by itself.  No: use Alt+R to receive one." };
+    int sel = 0, k, i, oldx = cx, oldy = cy;
+    BOOL oldvis = curvis, changed = FALSE;
+    char oldmode[sizeof(st_mode)];
+    memcpy(sc, chr, sizeof(sc)); memcpy(sa, att, sizeof(sa));
+    strcpy(oldmode, st_mode);
+    cursor_hide();
+    curvis = FALSE;
+    for (;;) {
+        char l[COLS + 8];
+        for (i = 0; i < ROWS; i++) put_at(i, 0, 0x07, "", COLS);
+        put_at(0, 0, 0x4F, "", COLS);
+        put_at(0, 2, 0x4F, "NilTerm  -  Settings", 40);
+        put_at(0, 59, 0x4B, "Esc = back (saved)", 20);
+        for (i = 0; i < 4; i++) {
+            const char *v = i == 0 ? (prefs.dl[0] ? prefs.dl : "(ask the first time)") :
+                            i == 1 ? prefs.ul : i == 2 ? prefs.cap : prefs.autozm ? "start by themselves" : "Alt+R only";
+            sprintf(l, " %-18s %.58s", label[i], v);
+            put_at(3 + i * 2, 1, i == sel ? 0x70 : 0x07, l, COLS - 2);
+        }
+        put_at(13, 2, 0x0B, help[sel], COLS - 4);
+        put_at(ROWS - 2, 0, 0x08, " -----------------------------------------------------------------------------", COLS);
+        put_at(ROWS - 1, 0, 0x0B, " Up/Down pick   Enter change (a folder requester, or yes/no)   Esc back", COLS);
+        strcpy(st_mode, "Settings");
+        status_draw();
+        flush();
+        k = ui_key();
+        if (k == K_UP && sel > 0) sel--;
+        else if (k == K_DOWN && sel < 3) sel++;
+        else if (k == K_ENTER || k == ' ') {
+            if (sel == 3) { prefs.autozm = !prefs.autozm; changed = TRUE; }
+            else {
+                char *f = sel == 0 ? prefs.dl : sel == 1 ? prefs.ul : prefs.cap;
+                if (ask_drawer(label[sel], f, sizeof(prefs.dl))) changed = TRUE;
+            }
+        } else if (k == K_ESC || k == K_QUIT || k == 'q' || k == 'Q') break;
+    }
+    if (changed) prefs_save();
+    memcpy(chr, sc, sizeof(sc)); memcpy(att, sa, sizeof(sa));
+    for (i = 0; i < SROWS; i++) mark(i, 0, COLS - 1);
+    strcpy(st_mode, oldmode);
+    cx = oldx; cy = oldy; curvis = oldvis;
+    status_draw();
+    flush();
+}
+
+/* ---- file transfers: NilBBS's own ZMODEM / X/YMODEM (src/node, via ntzm.c / ntxy.c) -----------
+ * They talk to "the node": here that's this connection.  While one runs, data_byte() puts the
+ * incoming bytes in the ring below instead of on the screen; tn_wait() reads the socket,
+ * shows progress on the status bar and turns Esc into a cancel (N.online = FALSE). */
+#define ZIN_SIZE 16384                  /* a power of two */
+struct NodeCtx N;
+static UBYTE zin[ZIN_SIZE];
+static struct ZStats *xst;              /* the running transfer's counters, for the status bar */
+static const char *xwhat;
+static ULONG xshown;
+
+LONG in_avail(void) { return (LONG)((N.in_head - N.in_tail) & (ZIN_SIZE - 1)); }
+
+static void zin_put(UBYTE c)
+{
+    UWORD next = (N.in_head + 1) & (ZIN_SIZE - 1);
+    if (next == N.in_tail) return;      /* can't happen: tn_wait() only reads what fits */
+    zin[N.in_head] = c;
+    N.in_head = next;
+}
+
+LONG in_get(void)
+{
+    UBYTE c;
+    if (N.in_head == N.in_tail) return -1;
+    c = zin[N.in_tail];
+    N.in_tail = (N.in_tail + 1) & (ZIN_SIZE - 1);
+    return c;
+}
+
+void in_unget(UBYTE c)
+{
+    UWORD prev = (N.in_tail - 1) & (ZIN_SIZE - 1);
+    if (prev == N.in_head) return;
+    N.in_tail = prev;
+    zin[prev] = c;
+}
+
+void tn_raw(const UBYTE *buf, LONG len) { while (len-- > 0) ob_data(*buf++); }
+BOOL tn_flush(void) { ob_flush(); return !closed; }
+void tn_rawflush(const UBYTE *buf, LONG len) { tn_raw(buf, len); ob_flush(); }
+void tn_set_binary(BOOL on) { (void)on; }      /* the BBS asks for BINARY; tn_option() agrees */
+
+static void xfer_status(BOOL force)
+{
+    ULONG s = now_secs();
+    if (!xst || (!force && s == xshown)) return;
+    xshown = s;
+    sprintf(st_mode, "%s: file %ld, %lu KB  (Esc cancels)", xwhat, (long)(xst->file ? xst->file : 1),
+            (unsigned long)((xst->total + xst->bytes) / 1024));
+    cursor_hide();
+    status_draw();
+    flush();
+}
+
+LONG tn_wait(ULONG ms, ULONG extrasigs, ULONG *gotsigs)
+{
+    static UBYTE buf[4096];
+    fd_set r;
+    struct timeval tv;
+    ULONG sigs = (1UL << win->UserPort->mp_SigBit) | SIGBREAKF_CTRL_C;
+    LONG n;
+    (void)extrasigs;
+    if (gotsigs) *gotsigs = 0;
+    ob_flush();
+    if (in_avail()) return in_avail();
+    if (closed || sock < 0) { N.online = FALSE; return 0; }
+    xfer_status(FALSE);
+    FD_ZERO(&r);
+    FD_SET(sock, &r);
+    tv.tv_sec = ms / 1000; tv.tv_usec = (ms % 1000) * 1000;
+    n = WaitSelect(sock + 1, &r, NULL, NULL, &tv, &sigs);
+    if (sigs & SIGBREAKF_CTRL_C) N.online = FALSE;
+    if (sigs & (1UL << win->UserPort->mp_SigBit)) {     /* Esc: cancel; other keys: ignored */
+        struct IntuiMessage *m;
+        while ((m = (struct IntuiMessage *)GetMsg(win->UserPort))) {
+            if (m->Class == IDCMP_RAWKEY && m->Code == 0x45) N.online = FALSE;
+            if (m->Class == IDCMP_REFRESHWINDOW) { BeginRefresh(win); EndRefresh(win, TRUE); }
+            ReplyMsg((struct Message *)m);
+        }
+    }
+    if (n > 0 && FD_ISSET(sock, &r)) {
+        LONG room = ZIN_SIZE - 1 - in_avail(), got, i;
+        if (room > (LONG)sizeof(buf)) room = sizeof(buf);
+        if (room > 0) {
+            got = recv(sock, buf, room, 0);
+            if (got <= 0) { closed = TRUE; N.online = FALSE; }
+            else for (i = 0; i < got; i++) tn_byte(buf[i]);
+        }
+    }
+    return in_avail();
+}
+
+/* the download drawer: ENV:NilTerm/DownloadDir, asked for (and saved) the first time */
+static BOOL dl_dir(char *dir, int max)
+{
+    if (cur_ent && cur_ent->dl[0]) { strncpy(dir, cur_ent->dl, max - 1); dir[max - 1] = 0; return TRUE; }
+    if (prefs.dl[0]) { strncpy(dir, prefs.dl, max - 1); dir[max - 1] = 0; return TRUE; }
+    if (!AslBase) { strcpy(dir, "RAM:"); return TRUE; }
+    dir[0] = 0;
+    if (!ask_drawer("Where should downloads go?", dir, max)) return FALSE;
+    strncpy(prefs.dl, dir, sizeof(prefs.dl) - 1);
+    prefs_save();                       /* change it later in Settings */
+    return TRUE;
+}
+
+static void xfer_begin(const char *what, struct ZStats *st)
+{
+    memset(st, 0, sizeof(*st));
+    N.online = TRUE;
+    N.in_head = N.in_tail = 0;
+    xst = st; xwhat = what; xshown = 0;
+    xfer = TRUE;
+    xfer_status(TRUE);
+}
+
+static void xfer_end(LONG files, const char *verb, const char *where)
+{
+    char msg[160];
+    xfer = FALSE;
+    xst = NULL;
+    N.in_head = N.in_tail = 0;
+    if (closed) N.online = FALSE;
+    if (files > 0) sprintf(msg, "%s: %ld file%s %s %s", xwhat, (long)files, files == 1 ? "" : "s", verb, where);
+    else sprintf(msg, "%s: %s (%s)", xwhat, files == 0 ? "nothing transferred" : "cancelled / no answer", where);
+    strncpy(st_mode, msg, sizeof(st_mode) - 1);
+    cursor_hide();
+    status_draw();
+    flush();
+    Delay(files > 0 ? 150 : 250);       /* read it (a failure a little longer), then back to the clock */
+    st_mode[0] = 0;
+    status_draw();
+    flush();
+}
+
+/* ZMODEM download: started by the BBS ("**" ZDLE "B00" = ZRQINIT), zm_watch() spots it */
+static BOOL zm_go;
+static int zm_seen;
+static void zm_watch(UBYTE c)
+{
+    static const UBYTE zrqinit[] = { '*', '*', 0x18, 'B', '0', '0' };
+    if (xfer || !prefs.autozm) return;
+    if (c == zrqinit[zm_seen]) { if (++zm_seen == (int)sizeof(zrqinit)) { zm_seen = 0; zm_go = TRUE; xfer = TRUE; } }
+    else zm_seen = (c == '*') ? 1 : 0;
+}
+
+static void zm_download(void)
+{
+    static char names[16][32];
+    struct ZStats st;
+    char dir[200];
+    LONG n;
+    zm_go = FALSE;
+    if (!dl_dir(dir, sizeof(dir))) {    /* no drawer: tell the sender to stop */
+        static const UBYTE can[] = { 24,24,24,24,24,24,24,24,8,8,8,8,8,8,8,8 };
+        xfer = FALSE;
+        tn_rawflush(can, sizeof(can));
+        return;
+    }
+    xfer_begin("ZMODEM download", &st);
+    n = zm_receive(dir, names, 16, &st);
+    xfer_end(n, "saved in", dir);
+}
+
+/* Alt+U: send a file - ZMODEM, YMODEM or XMODEM (start the BBS's upload first) */
+static void upload(void)
+{
+    static char path[256] = "RAM:";
+    struct EasyStruct es = { sizeof(struct EasyStruct), 0, (UBYTE *)"NilTerm upload",
+        (UBYTE *)"Send a file with which protocol?\n(Start the upload on the BBS first.)",
+        (UBYTE *)"ZMODEM|YMODEM|XMODEM-1K|XMODEM|Cancel" };
+    struct ZStats st;
+    const char *paths[1], *names[1];
+    LONG r, n;
+    int proto;
+    r = EasyRequestArgs(win, &es, NULL, NULL);
+    if (r == 0) return;
+    proto = r == 1 ? PROTO_Z : r == 2 ? PROTO_Y : r == 3 ? PROTO_X1K : PROTO_X;
+    if (!strcmp(path, "RAM:") && prefs.ul[0]) strcpy(path, prefs.ul);
+    if (!ask_file("Upload which file?", path, sizeof(path), FALSE)) return;
+    paths[0] = path;
+    names[0] = (const char *)FilePart((STRPTR)path);
+    xfer_begin(proto == PROTO_Z ? "ZMODEM upload" : proto_name(proto), &st);
+    n = proto == PROTO_Z ? zm_send(paths, names, 1, &st) : xy_send(paths, names, 1, proto, &st);
+    xfer_end(n, "sent from", path);
+}
+
+/* Alt+R: receive with YMODEM or XMODEM (ZMODEM downloads start by themselves) */
+static void receive_xy(void)
+{
+    static char names[16][32];
+    static char xpath[256];
+    struct EasyStruct es = { sizeof(struct EasyStruct), 0, (UBYTE *)"NilTerm download",
+        (UBYTE *)"Receive with which protocol?\n(ZMODEM downloads start by themselves unless Settings says not.)",
+        (UBYTE *)"ZMODEM|YMODEM|XMODEM-1K|XMODEM|Cancel" };
+    struct ZStats st;
+    char dir[200];
+    LONG r, n;
+    int proto;
+    r = EasyRequestArgs(win, &es, NULL, NULL);
+    if (r == 0) return;
+    if (r == 1) { xfer = TRUE; zm_download(); return; }
+    proto = r == 2 ? PROTO_Y : r == 3 ? PROTO_X1K : PROTO_X;
+    if (!dl_dir(dir, sizeof(dir))) return;
+    if (proto != PROTO_Y) {             /* XMODEM carries no file name: ask for one */
+        if (!xpath[0]) path_join(xpath, dir, "download");
+        if (!ask_file("Save the XMODEM download as", xpath, sizeof(xpath), TRUE)) return;
+        strncpy(dir, xpath, sizeof(dir) - 1); dir[sizeof(dir) - 1] = 0;
+        *PathPart((STRPTR)dir) = 0;
+        str_copy(names[0], (const char *)FilePart((STRPTR)xpath), 32);
+    }
+    xfer_begin(proto_name(proto), &st);
+    n = xy_receive(dir, names, 16, proto, &st);
+    xfer_end(n, "saved in", dir);
+}
+
+/* ---- one call: connect, run the terminal until it ends ------------------------------------------ */
+enum { END_CLOSED, END_HANGUP, END_DIR, END_QUIT };
+static BOOL direct_mode;                /* HOST=/PORT= given: one call, no directory (BBSControl's Logon) */
+
+static int session(void)
+{
+    static UBYTE buf[4096];
+    ULONG shown_s = 0;
+    int why = END_CLOSED;
+    char msg[200];
+
+    memset(us, 0, sizeof(us)); memset(them, 0, sizeof(them));
+    tstate = T_DATA; pstate = S_NORM; closed = FALSE; obn = 0; action = ACT_NONE;
+    cursor_hide();
+    reset_term();
+    curvis = TRUE;
+    st_since = 0; st_mode[0] = 0;
+    sprintf(msg, "\x1b[0;36mNilTerm - connecting to %s port %ld...\x1b[0m\r\n", host_name, (long)host_port);
+    term_str(msg);
+    status_draw();
+    flush();
+    if (!connect_host()) { status_draw(); wait_any_key(10); return END_CLOSED; }
+    st_since = now_secs();
+
+    while (!quit && !closed) {
+        fd_set r;
+        struct timeval tv;
+        ULONG sigs = (1UL << win->UserPort->mp_SigBit) | SIGBREAKF_CTRL_C, s;
+        LONG n;
+        FD_ZERO(&r);
+        FD_SET(sock, &r);
+        tv.tv_sec = 1; tv.tv_usec = 0;              /* the status bar clock */
+        n = WaitSelect(sock + 1, &r, NULL, NULL, &tv, &sigs);
+        if (n < 0) break;
+        if (sigs & SIGBREAKF_CTRL_C) { quit = TRUE; break; }
+        if (sigs & (1UL << win->UserPort->mp_SigBit)) handle_idcmp();
+        if (n > 0 && FD_ISSET(sock, &r)) {
+            /* a burst: everything that's waiting (up to 32 KB) into the cells, then one redraw */
+            LONG total = 0;
+            cursor_hide();
+            beeped = FALSE;
+            for (;;) {
+                LONG got = recv(sock, buf, sizeof(buf), 0), i;
+                if (got <= 0) { closed = TRUE; break; }
+                for (i = 0; i < got; i++) tn_byte(buf[i]);
+                total += got;
+                if (total >= 32768 || xfer) break;     /* a download starting: the rest is its */
+                FD_ZERO(&r); FD_SET(sock, &r);
+                tv.tv_sec = 0; tv.tv_usec = 0;
+                if (WaitSelect(sock + 1, &r, NULL, NULL, &tv, NULL) <= 0) break;
+            }
+            ob_flush();         /* telnet answers + cursor reports, in order */
+            flush();
+            if (zm_go) zm_download();
+        }
+        if ((s = now_secs()) != shown_s) { shown_s = s; cursor_hide(); status_draw(); flush(); }
+        if (action) {
+            int a = action;
+            action = ACT_NONE;
+            if (a == ACT_HANGUP) { why = END_HANGUP; break; }
+            if (a == ACT_DIR) { why = END_DIR; break; }
+            if (a == ACT_BACK) scrollback();
+            else if (a == ACT_LOG) capture_toggle();
+            else if (a == ACT_COPY) clip_copy();
+            else if (a == ACT_PASTE) clip_paste();
+            else if (a == ACT_UPLOAD) upload();
+            else if (a == ACT_RECV) receive_xy();
+            else if (a == ACT_SET) settings();
+        }
+    }
+    if (quit) why = END_QUIT;
+    if (sock >= 0) { CloseSocket(sock); sock = -1; }
+    if (cap_fh) { cap_flush(); Close(cap_fh); cap_fh = 0; }
+    st_since = 0;
+    cursor_hide();
+    if (closed) {
+        term_str("\r\n\x1b[0;36m-- disconnected --\x1b[0m");
+        status_draw();
+        flush();
+        Delay(60);              /* the goodbye screen, a moment */
+    }
+    return why;
+}
+
+
+static int real_main(void)
+{
+    int rc = RETURN_FAIL, y;
+    char msg[160];
+
+    if (!(IntuitionBase = (struct IntuitionBase *)OpenLibrary((STRPTR)"intuition.library", 39)) ||
+        !(GfxBase = (struct GfxBase *)OpenLibrary((STRPTR)"graphics.library", 39)) ||
+        !(KeymapBase = OpenLibrary((STRPTR)"keymap.library", 37))) {
+        say("NilTerm: needs AmigaOS 3.0 or newer\n");
+        goto out;
+    }
+    if (!watch_node && !(SocketBase = OpenLibrary((STRPTR)"bsdsocket.library", 4))) {
+        say("NilTerm: no bsdsocket.library - start your TCP/IP stack first\n");
+        goto out;
+    }
+    AslBase = OpenLibrary((STRPTR)"asl.library", 38);
+    IFFParseBase = OpenLibrary((STRPTR)"iffparse.library", 39);
+    if (!open_screen(arg_modeid, arg_native, arg_small)) {
+        say("NilTerm: can't open a 640x400 or 640x200 16-colour screen\n");
+        goto out;
+    }
+    if (from_cli) {
+        sprintf(msg, "NilTerm: screen mode 0x%08lx (%s), 640x%d, %s glyphs\n",
+                modeid, modename, SROWS * CH, CH == 16 ? "8x16" : "8x8 half-height");
+        say(msg);
+    }
+    if (!make_font()) { say("NilTerm: out of chip memory\n"); goto out; }
+    if (!(win = OpenWindowTags(NULL,
+            WA_CustomScreen, (ULONG)scr,
+            WA_Left, 0, WA_Top, 0, WA_Width, scr->Width, WA_Height, scr->Height,
+            WA_Backdrop, TRUE, WA_Borderless, TRUE, WA_Activate, TRUE, WA_RMBTrap, TRUE,
+            WA_SmartRefresh, TRUE,
+            WA_IDCMP, IDCMP_RAWKEY | IDCMP_REFRESHWINDOW,
+            TAG_END))) {
+        say("NilTerm: can't open its window\n");
+        goto out;
+    }
+    rp = win->RPort;
+    SetFont(rp, &vfont);
+    SetRast(rp, 0);
+    for (y = 0; y < SROWS; y++) { dmin[y] = COLS; dmax[y] = -1; }
+    make_cp2lat();
+    prefs_load();
+    ScreenToFront(scr);
+
+    if (watch_node) {                   /* the caller's own 80x25, no status bar */
+        ROWS = SROWS; statusbar = FALSE;
+        reset_term();
+        rc = watch_loop();
+        goto out;
+    }
+    ROWS = SROWS - 1; statusbar = TRUE;
+    sb_chr = AllocVec(SBMAX * COLS, MEMF_ANY);
+    sb_att = AllocVec(SBMAX * COLS, MEMF_ANY);
+    if (!sb_chr || !sb_att) { if (sb_chr) FreeVec(sb_chr); sb_chr = NULL; }
+    reset_term();
+    rc = RETURN_OK;
+    if (direct_mode) {                  /* HOST=/PORT=: one call (BBSControl's Logon) */
+        default_port();
+        sprintf(st_name, "%s:%ld", host_name, (long)host_port);
+        session();
+    } else {
+        if (!(dir = AllocVec(DIR_MAX * sizeof(struct DirEnt), MEMF_CLEAR))) goto out;
+        dir_load();
+        while (!quit) {
+            int i = directory();
+            if (i < 0) break;
+            strncpy(host_name, dir[i].host, sizeof(host_name) - 1);
+            host_port = dir[i].port;
+            if (!host_port) default_port();
+            strncpy(st_name, dir[i].name, sizeof(st_name) - 1);
+            cur_ent = &dir[i];
+            dir_stamp(&dir[i]);
+            dir_save();
+            if (session() == END_QUIT) break;
+        }
+    }
+
+out:
+    if (sock >= 0) CloseSocket(sock);
+    if (cap_fh) { cap_flush(); Close(cap_fh); }
+    if (dir) FreeVec(dir);
+    if (sb_chr) FreeVec(sb_chr);
+    if (sb_att) FreeVec(sb_att);
+    if (AslBase) CloseLibrary(AslBase);
+    if (IFFParseBase) CloseLibrary(IFFParseBase);
+    if (win) CloseWindow(win);
+    if (scr) CloseScreen(scr);
+    if (strip) FreeVec(strip);
+    if (SocketBase) CloseLibrary(SocketBase);
+    if (KeymapBase) CloseLibrary(KeymapBase);
+    if (GfxBase) CloseLibrary((struct Library *)GfxBase);
+    if (IntuitionBase) CloseLibrary((struct Library *)IntuitionBase);
+    return rc;
+}
+
+/* Started from its icon: the same options as the Shell arguments, read from the
+ * icon's Tool Types (PORT=n, HOST=name, MODEID=hex, NATIVE, SMALL); anything
+ * missing keeps its default. */
+static void wb_tooltypes(struct WBStartup *wb)
+{
+    struct Library *IconBase;
+    struct DiskObject *dob;
+    BPTR old;
+    char *v;
+    if (!wb || wb->sm_NumArgs < 1) return;
+    if (!(IconBase = OpenLibrary((STRPTR)"icon.library", 37))) return;
+    old = CurrentDir(wb->sm_ArgList[0].wa_Lock);
+    if ((dob = GetDiskObject(wb->sm_ArgList[0].wa_Name))) {
+        CONST_STRPTR *tt = (CONST_STRPTR *)dob->do_ToolTypes;
+        if ((v = (char *)FindToolType(tt, (STRPTR)"PORT")) && atol(v) > 0) { host_port = atol(v); direct_mode = TRUE; }
+        if ((v = (char *)FindToolType(tt, (STRPTR)"HOST")) && *v) {
+            strncpy(host_name, v, sizeof(host_name) - 1); direct_mode = TRUE;
+        }
+        if ((v = (char *)FindToolType(tt, (STRPTR)"MODEID")) && *v) arg_modeid = strtoul(v, NULL, 16);
+        if (FindToolType(tt, (STRPTR)"NATIVE")) arg_native = TRUE;
+        if (FindToolType(tt, (STRPTR)"SMALL")) arg_small = TRUE;
+        if ((v = (char *)FindToolType(tt, (STRPTR)"WATCH")) && atol(v) > 0) watch_node = (int)atol(v);
+        FreeDiskObject(dob);
+    }
+    CurrentDir(old);
+    CloseLibrary(IconBase);
+}
+
+/* No PORT= given: the port the running NilBBS listens on, else port= in its config, else 2323 */
+static void default_port(void)
+{
+    struct BBSShared *S;
+    struct Cfg *c;
+    if (host_port > 0) return;
+    if ((S = shared_find()) && S->port) { host_port = S->port; return; }
+    if ((c = cfg_load(bbs_config()))) { host_port = cfg_int(c, "port", 0); cfg_free(c); }
+    if (host_port <= 0) host_port = 2323;
+}
+
+int main(int argc, char **argv)
+{
+    if (argc == 0) wb_tooltypes((struct WBStartup *)argv);   /* from its icon */
+    if (argc > 0) {             /* from a Shell */
+        static LONG a[6];
+        struct RDArgs *rd;
+        from_cli = TRUE;
+        if (!(rd = ReadArgs((STRPTR)"PORT/N,HOST/K,MODEID/K,NATIVE/S,SMALL/S,WATCH/K/N", a, NULL))) {
+            PrintFault(IoErr(), (STRPTR)"NilTerm");
+            return RETURN_FAIL;
+        }
+        if (a[0]) { host_port = *(LONG *)a[0]; direct_mode = TRUE; }
+        if (a[1]) { strncpy(host_name, (char *)a[1], sizeof(host_name) - 1); direct_mode = TRUE; }
+        if (a[2]) arg_modeid = strtoul((char *)a[2], NULL, 16);
+        arg_native = a[3] != 0;
+        arg_small = a[4] != 0;
+        if (a[5]) watch_node = (int)*(LONG *)a[5];
+        FreeArgs(rd);
+    }
+    return run_with_stack(16384, real_main);
+}

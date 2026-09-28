@@ -1,0 +1,31 @@
+Short:        ANSI telnet BBS client (SyncTERM-style)
+Author:       NilBBS
+Uploader:     NilBBS
+Type:         comm/tcp
+Version:      1.0
+Requires:     AmigaOS 3.0+, 68020+, bsdsocket.library TCP/IP stack
+Architecture: m68k-amigaos >= 3.0.0
+
+NilTerm calls telnet BBSes the way SyncTERM does on a PC.
+
+ - Its own 640x400 16-colour screen (graphics card or High Res Laced) with
+   80 columns of the IBM VGA 8x16 font and the PC's colours; full ANSI
+   (cursor movement, colours, scroll regions, insert/delete), CP437.
+ - Telnet done properly: terminal type ANSI, window size, binary mode, and
+   the cursor-position answers BBSes use to detect ANSI.
+ - A dialing directory: name, host, port and a download folder per system,
+   call counts and last-call dates; quick connect to any host:port.
+ - A status bar with the system and time online; Alt-key hotkeys.
+ - ZMODEM downloads that start by themselves; ZMODEM, YMODEM and XMODEM(-1K)
+   upload and download; progress on the status bar, Esc cancels.
+ - 2000 lines of scrollback, session capture (raw ANSI or plain text),
+   copy the screen to the clipboard and paste into a call.
+ - Settings for the download / upload / capture folders.
+
+Install with the included Installer script, or copy the NilTerm drawer
+anywhere.  The manual is NilTerm.guide.
+
+NilTerm is part of NilBBS, a telnet BBS for AmigaOS.  MIT licence.
+
+The screen font is IBM VGA 8x16 from "The Ultimate Oldschool PC Font Pack"
+by VileR, https://int10h.org/oldschool-pc-fonts/ - CC BY-SA 4.0.

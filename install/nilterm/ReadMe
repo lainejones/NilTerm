@@ -1,0 +1,44 @@
+NilTerm - an ANSI telnet client for the Amiga
+=============================================
+
+NilTerm calls telnet BBSes the way SyncTERM does on a PC: its own screen with
+80 columns of the IBM PC font in the 16 PC colours, a dialing directory, a
+status bar, scrollback, session capture, and ZMODEM downloads that start by
+themselves.  The full manual is NilTerm.guide.
+
+NEEDS
+  AmigaOS 3.0+ on a 68020 or better, and a TCP/IP stack (Roadshow, AmiTCP,
+  Miami, or an emulator's bsdsocket emulation).  A 640x400 screen mode: a
+  graphics card, or the chipset's High Res Laced.
+
+INSTALLING
+  Double-click Install_NilTerm.  It copies the NilTerm drawer (the program,
+  its icon, this ReadMe and the manual) where you choose.  An update replaces
+  the program and the manual and keeps your dialing directory and settings
+  (they live in ENVARC:).
+
+  By hand: copy the NilTerm drawer anywhere.  That's all it needs.
+
+USING IT
+  Double-click NilTerm: the dialing directory opens.
+    A add a system  E edit  D delete  C quick connect host:port
+    S settings      Return call it     Q quit
+  On a call:
+    Alt+D directory   Alt+H hang up    Alt+B scrollback  Alt+L capture
+    Alt+U upload      Alt+R receive    Alt+S settings    Alt+X quit
+    Amiga+C copy the screen   Amiga+V paste   Help the keys
+  ZMODEM downloads start by themselves; Esc cancels a transfer.  Downloads go
+  to the system's own folder (set in its directory entry) or the one in
+  Settings.
+
+  From a Shell:  NilTerm HOST=bbs.example.org PORT=23   calls straight away.
+
+FILES
+  ENVARC:NilTerm.lst     the dialing directory
+  ENVARC:NilTerm.prefs   the settings
+
+CREDITS
+  NilTerm is part of NilBBS, a telnet BBS for AmigaOS.  MIT licence (LICENSE).
+  Font: IBM VGA 8x16 from "The Ultimate Oldschool PC Font Pack" by VileR,
+  https://int10h.org/oldschool-pc-fonts/ - CC BY-SA 4.0,
+  https://creativecommons.org/licenses/by-sa/4.0/

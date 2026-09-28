@@ -1,0 +1,169 @@
+@database NilTerm.guide
+@author "NilBBS"
+@node Main "NilTerm"
+
+@{b}NilTerm@{ub} - an ANSI telnet client for the Amiga
+
+NilTerm connects to telnet BBSes the way SyncTERM does on a PC: its own screen,
+80 columns of the IBM PC font in the 16 PC colours, a dialing directory, and
+ZMODEM downloads that start by themselves.  It is also the sysop terminal that
+comes with NilBBS.
+
+  @{" Needs            " link Needs}  what NilTerm runs on
+  @{" Starting         " link Starting}  icon, Tool Types and Shell arguments
+  @{" Dialing directory" link Directory}  your list of systems
+  @{" While on a call  " link Keys}  the keys
+  @{" File transfers   " link Transfers}  ZMODEM, YMODEM, XMODEM
+  @{" Settings         " link Settings}  folders and ZMODEM auto-start
+  @{" Scrollback & logs" link Scrollback}  looking back, capturing, the clipboard
+  @{" Files it keeps   " link Files}  where things are saved
+  @{" Credits          " link Credits}  the font, the licences
+@endnode
+
+@node Needs "What NilTerm needs"
+@{b}What NilTerm needs@{ub}
+
+  - AmigaOS 3.0 or newer, a 68020 or better.
+  - A TCP/IP stack with bsdsocket.library: Roadshow, AmiTCP, Miami, or an
+    emulator's bsdsocket emulation (WinUAE, FS-UAE).
+  - A 640x400 16-colour screen mode: a graphics card's 640x400 or 640x480 mode,
+    or the chipset's High Res Laced.  With no 400-line mode it falls back to
+    640x200 with a squashed font.
+  - asl.library (file requesters) and iffparse.library (clipboard) - both come
+    with the OS.  Without them only those features are missing.
+@endnode
+
+@node Starting "Starting NilTerm"
+@{b}Starting NilTerm@{ub}
+
+Double-click the icon: the @{"dialing directory" link Directory} opens.
+
+From a Shell:
+@{fg shine}  NilTerm [PORT=]n [HOST=name] [MODEID=hex] [NATIVE] [SMALL]@{fg text}
+
+  HOST=, PORT=  call this system straight away, no directory; NilTerm quits
+                when the call ends.  PORT= alone calls this Amiga
+                (127.0.0.1).
+  MODEID=hex    use this screen mode (a display ID, as the ScreenMode prefs
+                show it).
+  NATIVE        don't pick a graphics card mode: use the chipset.
+  SMALL         640x200 with half-height letters.
+  WATCH=n       (NilBBS only) watch node n's caller's screen, read-only.
+
+The same words work as Tool Types on the icon, e.g. HOST=bbs.example.org and
+PORT=23 to make an icon that calls one system.
+@endnode
+
+@node Directory "The dialing directory"
+@{b}The dialing directory@{ub}
+
+Your list of systems, with how many times you've called each and when.
+
+  Up/Down, PgUp/PgDn   pick
+  Return               call the one picked
+  A                    add a system: name, host, port, and its own
+                       download folder (blank = the one in Settings,
+                       ? = pick one with a requester)
+  E                    edit the one picked
+  D, Del               delete it (asks first)
+  C                    quick connect: type host:port (port 23 if left out);
+                       the system is added to the list
+  S                    @{"Settings" link Settings}
+  Help                 the keys and credits
+  Q, Esc               quit
+
+A port of 0 means "the NilBBS on this Amiga, whatever port it listens on".
+When a call ends you're back in the directory.
+@endnode
+
+@node Keys "While on a call"
+@{b}While on a call@{ub}
+
+The bottom line is the status bar: the system, how long you've been on, LOG
+while a capture runs, and the Alt keys.  The BBS gets an 80x24 screen above
+it, as SyncTERM gives it.
+
+  Alt+D       back to the dialing directory (hangs up)
+  Alt+H       hang up
+  Alt+B       @{"scrollback" link Scrollback}
+  Alt+L       @{"capture" link Scrollback} the session to a file, on / off
+  Alt+U       @{"upload" link Transfers} a file
+  Alt+R       @{"receive" link Transfers} a file (ZMODEM, YMODEM, XMODEM)
+  Alt+S       @{"Settings" link Settings}
+  Alt+X       quit NilTerm (so does Amiga+Q)
+  Amiga+C     copy the screen to the clipboard
+  Amiga+V     paste the clipboard (as if typed)
+  Help        the keys and credits
+
+The cursor keys send what PC terminals send; Shift+Up/Down are PgUp/PgDn,
+Shift+Left/Right are Home/End, and a PC keyboard's Home/End/PgUp/PgDn/Insert
+keys work too.  Accented letters are sent in the PC character set.
+@endnode
+
+@node Transfers "File transfers"
+@{b}File transfers@{ub}
+
+@{b}Downloads.@{ub}  Pick ZMODEM on the BBS and just wait: NilTerm spots the
+transfer starting and receives it.  The status bar shows the file and how much
+has arrived; Esc cancels.  For YMODEM or XMODEM, start the download on the
+BBS, then press Alt+R and pick the protocol (XMODEM asks for a file name, as
+it doesn't carry one).
+
+@{b}Uploads.@{ub}  Start the upload on the BBS, press Alt+U, pick the protocol
+and the file.
+
+@{b}Where downloads go:@{ub} the system's own download folder if its directory
+entry has one, else the download folder in @{"Settings" link Settings}.  The very
+first time, if neither is set, NilTerm asks and remembers the answer.
+@endnode
+
+@node Settings "Settings"
+@{b}Settings@{ub}  (S in the directory, Alt+S during a call)
+
+  Download folder   where downloads are saved (a directory entry's own
+                    folder wins)
+  Upload folder     where the upload file requester opens
+  Capture folder    where Alt+L log files go
+  ZMODEM downloads  "start by themselves", or "Alt+R only"
+
+Up/Down picks, Return changes (a folder requester, or yes/no), Esc goes back
+and saves.
+@endnode
+
+@node Scrollback "Scrollback, capture, the clipboard"
+@{b}Scrollback@{ub}  (Alt+B)
+The last 2000 lines that scrolled off the top.  Up/Down, PgUp/PgDn (or
+Shift+Up/Down), Home/End; any other key goes back to the call.
+
+@{b}Capture@{ub}  (Alt+L)
+Logs everything the BBS sends from now on.  "Raw ANSI" keeps the colours and
+cursor moves (view it later in NilTerm or SyncTERM); "Plain text" keeps only
+the words.  An existing file grows.  Alt+L again stops.
+
+@{b}Clipboard@{ub}
+Amiga+C copies what's on screen as text (the PC's line-drawing characters
+become + - | #).  Amiga+V types the clipboard into the call.
+@endnode
+
+@node Files "Files NilTerm keeps"
+@{b}Files NilTerm keeps@{ub}
+
+  ENVARC:NilTerm.lst     the dialing directory (plain text: [name], then
+                         host=, port=, calls=, last=, download=)
+  ENVARC:NilTerm.prefs   the settings
+
+Both are made the first time they're needed; delete them to start afresh.
+@endnode
+
+@node Credits "Credits"
+@{b}Credits@{ub}
+
+NilTerm is part of NilBBS, a telnet BBS for AmigaOS.  Its file transfers use
+NilBBS's own ZMODEM and X/YMODEM code.  NilTerm is released under the MIT
+licence - see the LICENSE file.
+
+The screen font is IBM VGA 8x16 from "The Ultimate Oldschool PC Font Pack" by
+VileR, https://int10h.org/oldschool-pc-fonts/ - licensed under Creative
+Commons Attribution-ShareAlike 4.0 International (CC BY-SA 4.0),
+https://creativecommons.org/licenses/by-sa/4.0/
+@endnode
