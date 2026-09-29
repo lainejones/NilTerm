@@ -165,6 +165,11 @@ void  tcheck_messages(void);
 BOOL  do_login(void);
 void  do_logoff(void);
 LONG  time_left_mins(void);                 /* -1 = unlimited */
+int   vis_len(const char *s);               /* menu.c: width of a string with |xx codes */
+void  put_rep(const char *glyph, int n);    /* menu.c: a glyph n times */
+LONG  ratio_allowed_kb(void);               /* fileui.c: KB the ratio still allows, -1 = no limit */
+void  user_status(void);                    /* misc.c: the Your Status screen */
+void  wall_mci(int i, char *out, int max, int *pen);   /* misc.c: |WA..|WL, the wall's lines */
 void  user_save(void);
 void  user_refresh(void);
 
