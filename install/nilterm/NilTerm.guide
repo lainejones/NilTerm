@@ -2,19 +2,23 @@
 @author "NilBBS"
 @node Main "NilTerm"
 
-@{b}NilTerm@{ub} - an ANSI telnet client for the Amiga
+@{b}NilTerm@{ub} - an ANSI BBS terminal for the Amiga
 
-NilTerm connects to telnet BBSes the way SyncTERM does on a PC: its own screen,
-80 columns of the IBM PC font in the 16 PC colours, a dialing directory, and
-ZMODEM downloads that start by themselves.  It is also the sysop terminal that
-comes with NilBBS.
+NilTerm calls BBSes the way SyncTERM does on a PC: its own screen, 80 columns
+of the IBM PC font in the 16 PC colours, a dialing directory, auto-login, and
+ZMODEM downloads that start by themselves.  It talks telnet, rlogin and raw
+TCP, and dials out with a modem.  It is also the sysop terminal that comes
+with NilBBS.
 
   @{" Needs            " link Needs}  what NilTerm runs on
   @{" Starting         " link Starting}  icon, Tool Types and Shell arguments
   @{" Dialing directory" link Directory}  your list of systems
+  @{" A system's entry " link Entry}  connection, login, screen, speed
+  @{" Auto-login       " link Login}  your name and password, sent for you
+  @{" Modems           " link Modem}  dialling out on the serial port
   @{" While on a call  " link Keys}  the keys
   @{" File transfers   " link Transfers}  ZMODEM, YMODEM, XMODEM
-  @{" Settings         " link Settings}  folders and ZMODEM auto-start
+  @{" Settings         " link Settings}  folders, ZMODEM, the modem
   @{" Scrollback & logs" link Scrollback}  looking back, capturing, the clipboard
   @{" Files it keeps   " link Files}  where things are saved
   @{" Credits          " link Credits}  the font, the licences
@@ -24,8 +28,9 @@ comes with NilBBS.
 @{b}What NilTerm needs@{ub}
 
   - AmigaOS 3.0 or newer, a 68020 or better.
-  - A TCP/IP stack with bsdsocket.library: Roadshow, AmiTCP, Miami, or an
-    emulator's bsdsocket emulation (WinUAE, FS-UAE).
+  - For telnet / rlogin / raw: a TCP/IP stack with bsdsocket.library -
+    Roadshow, AmiTCP, Miami, or an emulator's bsdsocket emulation.
+    For a modem: just the serial port (serial.device or a card's driver).
   - A 640x400 16-colour screen mode: a graphics card's 640x400 or 640x480 mode,
     or the chipset's High Res Laced.  With no 400-line mode it falls back to
     640x200 with a squashed font.
@@ -41,9 +46,9 @@ Double-click the icon: the @{"dialing directory" link Directory} opens.
 From a Shell:
 @{fg shine}  NilTerm [PORT=]n [HOST=name] [MODEID=hex] [NATIVE] [SMALL]@{fg text}
 
-  HOST=, PORT=  call this system straight away, no directory; NilTerm quits
-                when the call ends.  PORT= alone calls this Amiga
-                (127.0.0.1).
+  HOST=, PORT=  call this system (telnet) straight away, no directory;
+                NilTerm quits when the call ends.  PORT= alone calls this
+                Amiga (127.0.0.1).
   MODEID=hex    use this screen mode (a display ID, as the ScreenMode prefs
                 show it).
   NATIVE        don't pick a graphics card mode: use the chipset.
@@ -61,9 +66,7 @@ Your list of systems, with how many times you've called each and when.
 
   Up/Down, PgUp/PgDn   pick
   Return               call the one picked
-  A                    add a system: name, host, port, and its own
-                       download folder (blank = the one in Settings,
-                       ? = pick one with a requester)
+  A                    add a system (@{"the entry form" link Entry})
   E                    edit the one picked
   D, Del               delete it (asks first)
   C                    quick connect: type host:port (port 23 if left out);
@@ -72,23 +75,101 @@ Your list of systems, with how many times you've called each and when.
   Help                 the keys and credits
   Q, Esc               quit
 
-A port of 0 means "the NilBBS on this Amiga, whatever port it listens on".
 When a call ends you're back in the directory.
+@endnode
+
+@node Entry "A system's entry"
+@{b}A system's entry@{ub}  (A or E in the directory)
+
+One line per setting.  Up/Down picks a line, Return changes it (type, then
+Return), Left/Right steps through the choices on a < choice > line, Del
+clears a text.  S saves; Esc leaves (it asks whether to keep any changes).
+
+  Name              what the directory calls it
+  Connection        telnet - most BBSes
+                    raw    - plain TCP, no telnet talk
+                    rlogin - port 513; logs you in with the name (and, as
+                             Synchronet expects, the password)
+                    modem  - dial out on the serial port (@{"Modems" link Modem})
+  Address / number  host name or address; for a modem, the number to dial
+                    (blank = a direct serial line: null-modem cable, or a
+                    WiFi modem in transparent mode)
+  Port              telnet 23, rlogin 513; 0 = the NilBBS on this Amiga,
+                    whatever port it listens on
+  User name,
+  Password          your login on that system (@{"Auto-login" link Login})
+  Auto-login        on: answer the name and password prompts by itself;
+                    off: Alt+L sends them when you want
+  Screen            PC: the IBM font and character set (most BBSes).
+                    Amiga: the Topaz font from ROM, the Amiga (Latin-1)
+                    character set, and the Amiga's one-byte CSI (0x9B) - for
+                    BBSes that send Amiga ANSI.
+  Line speed        full speed, or show the text at a modem's pace (300 to
+                    115200 bps) - ANSI animations were drawn for that.
+                    Alt+Up / Alt+Down change it during a call.
+  iCE colours       when the BBS asks (ESC[?33h), or always: the "blink"
+                    attribute gives a bright background instead of blinking
+                    text, as iCE art expects
+  Download folder   this system's downloads go here; blank = the Settings one
+@endnode
+
+@node Login "Auto-login"
+@{b}Auto-login@{ub}
+
+Put your user name and password in the system's @{"entry" link Entry}.  With
+Auto-login on, NilTerm watches the first two minutes of a call: when the BBS
+asks for your name (a prompt with name, handle, login, user or alias in it,
+ending in : or ?) it types the name; when it asks for a password it types the
+password.  Each is sent once.
+
+Alt+L sends them by hand: the name then the password, or just the password if
+the name has gone already.
+
+@{b}The password is kept in ENVARC:NilTerm.lst as plain text@{ub} (as SyncTERM keeps
+its own).  Anyone who can read your disk can read it - leave it blank for a
+system that matters, and type it yourself.
+@endnode
+
+@node Modem "Modems"
+@{b}Modems@{ub}
+
+Set the port up once in @{"Settings" link Settings}: the device (serial.device, or your
+serial card's driver), its unit, the speed between the Amiga and the modem,
+hardware handshake (RTS/CTS - leave it on for a modem), the init string (ATZ)
+and the dial command (ATDT, or ATDP for pulse).
+
+Then make an entry with Connection "modem" and the phone number.  Calling it
+sends the init string, dials, and shows what the modem says; CONNECT starts the
+call, BUSY / NO CARRIER / NO ANSWER end it.  Esc stops the dialling.
+
+Alt+H (or Alt+D) hangs up: +++, ATH0, and DTR drops as the port closes.  A
+call also ends when the modem says NO CARRIER.
+
+With no number the entry is a @{b}direct line@{ub}: nothing is dialled, you're on as
+soon as the port opens.  A null-modem cable without handshake wires needs
+Hardware handshake off; otherwise nothing is sent, and NilTerm says so after
+ten seconds.
+
+Auto-login, the Amiga screen, the line speed and file transfers all work over
+a modem as over telnet.
 @endnode
 
 @node Keys "While on a call"
 @{b}While on a call@{ub}
 
-The bottom line is the status bar: the system, how long you've been on, LOG
-while a capture runs, and the Alt keys.  The BBS gets an 80x24 screen above
-it, as SyncTERM gives it.
+The bottom line is the status bar: the system, how long you've been on, CAP
+while a capture runs, the emulated line speed, and the Alt keys.  The BBS gets
+an 80x24 screen above it, as SyncTERM gives it.
 
   Alt+D       back to the dialing directory (hangs up)
   Alt+H       hang up
+  Alt+L       send your @{"user name and password" link Login}
   Alt+B       @{"scrollback" link Scrollback}
-  Alt+L       @{"capture" link Scrollback} the session to a file, on / off
+  Alt+C       @{"capture" link Scrollback} the session to a file, on / off
   Alt+U       @{"upload" link Transfers} a file
   Alt+R       @{"receive" link Transfers} a file (ZMODEM, YMODEM, XMODEM)
+  Alt+Up      line speed faster (past 115200: full speed)
+  Alt+Down    line speed slower (from full speed: 115200)
   Alt+S       @{"Settings" link Settings}
   Alt+X       quit NilTerm (so does Amiga+Q)
   Amiga+C     copy the screen to the clipboard
@@ -97,7 +178,10 @@ it, as SyncTERM gives it.
 
 The cursor keys send what PC terminals send; Shift+Up/Down are PgUp/PgDn,
 Shift+Left/Right are Home/End, and a PC keyboard's Home/End/PgUp/PgDn/Insert
-keys work too.  Accented letters are sent in the PC character set.
+keys work too.  Accented letters are sent in the PC character set (in the
+Amiga character set on an Amiga-screen entry).
+
+(NilTerm 1.1 had capture on Alt+L; it is Alt+C now, as in SyncTERM.)
 @endnode
 
 @node Transfers "File transfers"
@@ -115,19 +199,27 @@ and the file.
 @{b}Where downloads go:@{ub} the system's own download folder if its directory
 entry has one, else the download folder in @{"Settings" link Settings}.  The very
 first time, if neither is set, NilTerm asks and remembers the answer.
+
+Transfers run at full speed whatever the emulated line speed is.
 @endnode
 
 @node Settings "Settings"
 @{b}Settings@{ub}  (S in the directory, Alt+S during a call)
 
-  Download folder   where downloads are saved (a directory entry's own
-                    folder wins)
-  Upload folder     where the upload file requester opens
-  Capture folder    where Alt+L log files go
-  ZMODEM downloads  "start by themselves", or "Alt+R only"
+  Download folder     where downloads are saved (a directory entry's own
+                      folder wins)
+  Upload folder       where the upload file requester opens
+  Capture folder      where Alt+C log files go
+  ZMODEM downloads    "start by themselves", or "Alt+R only"
+  Serial device       for @{"modem" link Modem} entries: serial.device, or a card's
+  Serial unit         driver and its unit
+  Serial speed        Amiga <-> modem, bps
+  Hardware handshake  RTS/CTS on or off
+  Modem init          sent before dialling (ATZ); blank = nothing
+  Dial command        put before the number (ATDT)
 
-Up/Down picks, Return changes (a folder requester, or yes/no), Esc goes back
-and saves.
+Up/Down picks, Return changes (a folder requester, typing, or the next
+choice), Left/Right step through choices, Esc goes back and saves.
 @endnode
 
 @node Scrollback "Scrollback, capture, the clipboard"
@@ -135,10 +227,10 @@ and saves.
 The last 2000 lines that scrolled off the top.  Up/Down, PgUp/PgDn (or
 Shift+Up/Down), Home/End; any other key goes back to the call.
 
-@{b}Capture@{ub}  (Alt+L)
+@{b}Capture@{ub}  (Alt+C)
 Logs everything the BBS sends from now on.  "Raw ANSI" keeps the colours and
 cursor moves (view it later in NilTerm or SyncTERM); "Plain text" keeps only
-the words.  An existing file grows.  Alt+L again stops.
+the words.  An existing file grows.  Alt+C again stops.
 
 @{b}Clipboard@{ub}
 Amiga+C copies what's on screen as text (the PC's line-drawing characters
@@ -149,7 +241,8 @@ become + - | #).  Amiga+V types the clipboard into the call.
 @{b}Files NilTerm keeps@{ub}
 
   ENVARC:NilTerm.lst     the dialing directory (plain text: [name], then
-                         host=, port=, calls=, last=, download=)
+                         host=, port=, type=, user=, password=, ... -
+                         passwords are NOT encrypted)
   ENVARC:NilTerm.prefs   the settings
 
 Both are made the first time they're needed; delete them to start afresh.
@@ -166,4 +259,5 @@ The screen font is IBM VGA 8x16 from "The Ultimate Oldschool PC Font Pack" by
 VileR, https://int10h.org/oldschool-pc-fonts/ - licensed under Creative
 Commons Attribution-ShareAlike 4.0 International (CC BY-SA 4.0),
 https://creativecommons.org/licenses/by-sa/4.0/
+In the Amiga screen mode the font is the Topaz in the Kickstart ROM.
 @endnode

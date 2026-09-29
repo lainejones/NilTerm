@@ -1,5 +1,10 @@
 /*
- * NilTerm - an ANSI telnet client for the Amiga (and the NilBBS sysop's terminal).
+ * NilTerm - an ANSI BBS terminal for the Amiga (and the NilBBS sysop's terminal).
+ *
+ * Calls over telnet, raw TCP, rlogin, or a modem / direct line on serial.device (conn_*),
+ * from a SyncTERM-style dialing directory: per system its login (auto-login at the name /
+ * password prompts, or Alt+L), a PC or Amiga screen (Topaz from ROM, Latin-1, 0x9B = CSI),
+ * an emulated line speed (Alt+Up/Down) and iCE colours; blinking text blinks.
  *
  *   NilTerm [PORT=]n [HOST=name] [MODEID=hex] [NATIVE] [SMALL]
  *
@@ -40,6 +45,8 @@
 #include <graphics/modeid.h>
 #include <graphics/displayinfo.h>
 #include <devices/inputevent.h>
+#include <devices/serial.h>
+#include <devices/timer.h>
 #include <workbench/startup.h>
 #include <workbench/workbench.h>
 #include <proto/exec.h>
@@ -52,6 +59,7 @@
 #include <libraries/asl.h>
 #include <proto/iffparse.h>
 #include <libraries/iffparse.h>
+#include <proto/timer.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -98,6 +106,10 @@ static const UBYTE vga[16][3] = {
 
 /* ---- the terminal state ------------------------------------------------------------ */
 static UBYTE chr[SROWS][COLS], att[SROWS][COLS];     /* att = fg pen | bg pen << 4 */
+static UBYTE blk[SROWS][COLS];                      /* 1 = the cell blinks (SGR 5 without iCE colours) */
+static BOOL blink_off;                              /* the blink phase: blinking text hidden */
+static BOOL ice, ice_force;                         /* iCE colours: blink = bright background (ESC[?33h) */
+static BOOL amiga_mode;                             /* Topaz + Latin-1, 0x9B is CSI (an Amiga BBS) */
 static BYTE dmin[SROWS], dmax[SROWS];                 /* dirty span per row (dmin > dmax = clean) */
 static int cx, cy;                                  /* cursor, 0-based */
 static int stop = 0, sbot = SROWS - 2;              /* scroll region */
@@ -117,14 +129,185 @@ static BOOL par_any;
 static char priv;                                   /* '?', '=', '<', '>' or 0 */
 static BOOL inter;                                  /* an intermediate byte: not a sequence we know */
 
-/* ---- the connection ------------------------------------------------------------------ */
+/* ---- the connection ------------------------------------------------------------------ *
+ * Telnet, raw TCP and rlogin run over a socket; a modem (or a direct serial line) over
+ * serial.device.  conn_send() / conn_wait() hide which. */
+enum { CT_TELNET, CT_RAW, CT_RLOGIN, CT_MODEM };
+static int ctype = CT_TELNET;
 static LONG sock = -1;
 static BOOL closed;
 static UBYTE ob[1024];
 static int obn;
 
+struct Device *TimerBase;
+static struct MsgPort *tm_port;
+static struct timerequest *tm_io;       /* waits when there's no socket to WaitSelect() on */
+
+static struct MsgPort *ser_port, *ser_rport;
+static struct IOExtSer *ser_io, *ser_rd;   /* writes / queries (synchronous), the 1-byte read kept waiting */
+static UBYTE ser_rbyte;
+static BOOL ser_open_ok, ser_rd_busy;
+
+static BOOL ser_stuck;                  /* a write never went: no CTS from the modem / cable */
+static ULONG sig_wait(ULONG ms, ULONG mask);
+static void ser_write(const UBYTE *p, LONG n)
+{
+    int t = 0;
+    if (!ser_open_ok || n <= 0 || ser_stuck) return;
+    ser_io->IOSer.io_Command = CMD_WRITE;
+    ser_io->IOSer.io_Data = (APTR)p;
+    ser_io->IOSer.io_Length = n;
+    SendIO((struct IORequest *)ser_io);
+    while (!CheckIO((struct IORequest *)ser_io)) {
+        if (++t > 200) {                /* 10 s: handshake says "wait" and never stops */
+            AbortIO((struct IORequest *)ser_io);
+            WaitIO((struct IORequest *)ser_io);
+            ser_stuck = closed = TRUE;
+            return;
+        }
+        sig_wait(50, 1UL << ser_port->mp_SigBit);
+    }
+    if (WaitIO((struct IORequest *)ser_io)) closed = TRUE;
+}
+
+static void ser_arm(void)
+{
+    if (!ser_open_ok || ser_rd_busy) return;
+    ser_rd->IOSer.io_Command = CMD_READ;
+    ser_rd->IOSer.io_Data = &ser_rbyte;
+    ser_rd->IOSer.io_Length = 1;
+    SendIO((struct IORequest *)ser_rd);
+    ser_rd_busy = TRUE;
+}
+
+/* what has arrived, up to max bytes; never blocks (0 = nothing yet) */
+static LONG ser_read(UBYTE *buf, LONG max)
+{
+    LONG n = 0, more;
+    if (!ser_open_ok || max <= 0) return 0;
+    if (!ser_rd_busy) ser_arm();
+    if (!CheckIO((struct IORequest *)ser_rd)) return 0;
+    WaitIO((struct IORequest *)ser_rd);
+    ser_rd_busy = FALSE;
+    if (ser_rd->IOSer.io_Error) { ser_arm(); return 0; }
+    buf[n++] = ser_rbyte;
+    ser_io->IOSer.io_Command = SDCMD_QUERY;
+    DoIO((struct IORequest *)ser_io);
+    more = (LONG)ser_io->IOSer.io_Actual;
+    if (more > max - 1) more = max - 1;
+    if (more > 0) {
+        ser_io->IOSer.io_Command = CMD_READ;
+        ser_io->IOSer.io_Data = buf + 1;
+        ser_io->IOSer.io_Length = more;
+        DoIO((struct IORequest *)ser_io);   /* an overrun error still hands over what it read */
+        n += ser_io->IOSer.io_Actual;
+    }
+    ser_arm();
+    return n;
+}
+
+static void ser_close(void)
+{
+    if (ser_open_ok) {
+        if (ser_rd_busy) {
+            AbortIO((struct IORequest *)ser_rd);
+            WaitIO((struct IORequest *)ser_rd);
+            ser_rd_busy = FALSE;
+        }
+        CloseDevice((struct IORequest *)ser_io);      /* DTR drops: most modems hang up */
+        ser_open_ok = FALSE;
+    }
+    if (ser_rd) { DeleteIORequest((struct IORequest *)ser_rd); ser_rd = NULL; }
+    if (ser_io) { DeleteIORequest((struct IORequest *)ser_io); ser_io = NULL; }
+    if (ser_rport) { DeleteMsgPort(ser_rport); ser_rport = NULL; }
+    if (ser_port) { DeleteMsgPort(ser_port); ser_port = NULL; }
+}
+
+static BOOL ser_open(const char *dev, LONG unit, LONG baud, BOOL rtscts)
+{
+    if (!(ser_port = CreateMsgPort()) || !(ser_rport = CreateMsgPort())) { ser_close(); return FALSE; }
+    if (!(ser_io = (struct IOExtSer *)CreateIORequest(ser_port, sizeof(struct IOExtSer)))) { ser_close(); return FALSE; }
+    ser_io->io_SerFlags = rtscts ? SERF_7WIRE : 0;
+    if (OpenDevice((STRPTR)dev, unit, (struct IORequest *)ser_io, 0)) { ser_close(); return FALSE; }
+    ser_open_ok = TRUE;
+    ser_stuck = FALSE;
+    ser_io->io_Baud = baud;
+    ser_io->io_RBufLen = 16384;
+    ser_io->io_ReadLen = ser_io->io_WriteLen = 8;
+    ser_io->io_StopBits = 1;
+    ser_io->io_SerFlags = (rtscts ? SERF_7WIRE : 0) | SERF_XDISABLED;
+    ser_io->IOSer.io_Command = SDCMD_SETPARAMS;
+    DoIO((struct IORequest *)ser_io);           /* a speed it refuses: it keeps its own */
+    if (!(ser_rd = (struct IOExtSer *)CreateIORequest(ser_rport, sizeof(struct IOExtSer)))) { ser_close(); return FALSE; }
+    CopyMem(ser_io, ser_rd, sizeof(struct IOExtSer));
+    ser_rd->IOSer.io_Message.mn_ReplyPort = ser_rport;
+    ser_arm();
+    return TRUE;
+}
+
+/* sleep until one of `mask` or `ms` pass (timer.device); returns the signals that came */
+static ULONG sig_wait(ULONG ms, ULONG mask)
+{
+    ULONG got, tsig;
+    if (!tm_io) { got = SetSignal(0, mask) & mask; if (!got) { Delay(ms / 20 + 1); got = SetSignal(0, mask) & mask; } return got; }
+    tsig = 1UL << tm_port->mp_SigBit;
+    tm_io->tr_node.io_Command = TR_ADDREQUEST;
+    tm_io->tr_time.tv_secs = ms / 1000;
+    tm_io->tr_time.tv_micro = (ms % 1000) * 1000;
+    SetSignal(0, tsig);
+    SendIO((struct IORequest *)tm_io);
+    got = Wait(mask | tsig);
+    if (!CheckIO((struct IORequest *)tm_io)) AbortIO((struct IORequest *)tm_io);
+    WaitIO((struct IORequest *)tm_io);
+    return got & mask;
+}
+
+/* microseconds, for the speed emulation */
+static ULONG now_us(void)
+{
+    struct timeval tv;
+    if (!TimerBase) { struct DateStamp ds; DateStamp(&ds); return (ULONG)(ds.ds_Minute * 60 + ds.ds_Tick / 50) * 1000000UL + (ds.ds_Tick % 50) * 20000UL; }
+    GetSysTime(&tv);
+    return tv.tv_secs * 1000000UL + tv.tv_micro;
+}
+
+/*
+ * Wait up to ms for input (ms 0: just look).  Returns the bytes read into buf, 0 for none,
+ * -1 when the other end has gone; *sigs gets whichever of `mask` arrived.
+ */
+static LONG conn_wait(UBYTE *buf, LONG max, ULONG ms, ULONG mask, ULONG *sigs)
+{
+    LONG n;
+    *sigs = 0;
+    if (ctype == CT_MODEM) {
+        if (!ser_open_ok) return -1;
+        if ((n = ser_read(buf, max)) > 0) { *sigs = SetSignal(0, 0) & mask; return n; }
+        if (!ms) { *sigs = SetSignal(0, 0) & mask; return 0; }
+        *sigs = sig_wait(ms, mask | (1UL << ser_rport->mp_SigBit)) & mask;
+        return ser_read(buf, max);
+    }
+    if (sock < 0) { if (ms) *sigs = sig_wait(ms, mask); return -1; }
+    {
+        fd_set r;
+        struct timeval tv;
+        ULONG s = mask;
+        FD_ZERO(&r);
+        FD_SET(sock, &r);
+        tv.tv_secs = ms / 1000; tv.tv_micro = (ms % 1000) * 1000;
+        n = WaitSelect(sock + 1, &r, NULL, NULL, &tv, ms ? &s : NULL);
+        *sigs = ms ? (s & mask) : (SetSignal(0, 0) & mask);
+        if (n < 0) return -1;
+        if (n > 0 && FD_ISSET(sock, &r)) {
+            n = recv(sock, buf, max, 0);
+            return n > 0 ? n : -1;
+        }
+    }
+    return 0;
+}
+
 static void net_send(const UBYTE *p, int n)
 {
+    if (ctype == CT_MODEM) { ser_write(p, n); return; }
     while (n > 0 && sock >= 0) {
         LONG k = send(sock, (APTR)p, n, 0);
         if (k <= 0) { closed = TRUE; return; }
@@ -134,7 +317,7 @@ static void net_send(const UBYTE *p, int n)
 static void ob_flush(void) { if (obn) net_send(ob, obn); obn = 0; }
 static void ob_put(UBYTE c) { if (obn >= (int)sizeof(ob)) ob_flush(); ob[obn++] = c; }
 static void ob_str(const char *s) { while (*s) ob_put((UBYTE)*s++); }
-static void ob_data(UBYTE c) { ob_put(c); if (c == 255) ob_put(255); }   /* IAC doubled */
+static void ob_data(UBYTE c) { ob_put(c); if (c == 255 && ctype == CT_TELNET) ob_put(255); }   /* IAC doubled */
 
 /* ---- drawing ------------------------------------------------------------------------ */
 static void mark(int y, int x0, int x1)
@@ -145,10 +328,11 @@ static void mark(int y, int x0, int x1)
 
 static void draw_cells(int y, int x0, int x1)
 {
+#define EATT(y, x) (blink_off && blk[y][x] ? (UBYTE)((att[y][x] & 0xF0) | (att[y][x] >> 4)) : att[y][x])
     while (x0 <= x1) {
-        UBYTE a = att[y][x0];
+        UBYTE a = EATT(y, x0);
         int e = x0 + 1;
-        while (e <= x1 && att[y][e] == a) e++;
+        while (e <= x1 && EATT(y, e) == a) e++;
         SetABPenDrMd(rp, a & 15, a >> 4, JAM2);
         Move(rp, x0 * 8, y * CH + vfont.tf_Baseline);
         Text(rp, (STRPTR)&chr[y][x0], e - x0);
@@ -199,7 +383,7 @@ static void blank(int y, int x0, int x1)
     if (x0 < 0) x0 = 0;
     if (x1 > COLS - 1) x1 = COLS - 1;
     if (x0 > x1) return;
-    for (x = x0; x <= x1; x++) { chr[y][x] = ' '; att[y][x] = curattr; }
+    for (x = x0; x <= x1; x++) { chr[y][x] = ' '; att[y][x] = curattr; blk[y][x] = 0; }
     mark(y, x0, x1);
 }
 
@@ -228,6 +412,7 @@ static void scroll_up(int top, int bot, int n)
     for (y = top; y + n <= bot; y++) {
         memcpy(chr[y], chr[y + n], COLS);
         memcpy(att[y], att[y + n], COLS);
+        memcpy(blk[y], blk[y + n], COLS);
         dmin[y] = dmin[y + n]; dmax[y] = dmax[y + n];
     }
     for (y = bot - n + 1; y <= bot; y++) { dmin[y] = COLS; dmax[y] = -1; blank(y, 0, COLS - 1); }
@@ -246,6 +431,7 @@ static void scroll_down(int top, int bot, int n)
     for (y = bot; y - n >= top; y--) {
         memcpy(chr[y], chr[y - n], COLS);
         memcpy(att[y], att[y - n], COLS);
+        memcpy(blk[y], blk[y - n], COLS);
     }
     for (y = top; y < top + n; y++) blank(y, 0, COLS - 1);
 }
@@ -256,17 +442,21 @@ static void linefeed(void)
     else if (cy < ROWS - 1) cy++;
 }
 
+static int blink;
+static UBYTE curblink;
 static void set_attr(void)
 {
     int f = fg < 8 && bold ? fg + 8 : fg, b = bg;
+    if (blink && (ice || ice_force)) b |= 8;    /* iCE: blink means a bright background */
     if (rev) { int t = f; f = b; b = t; }
     curattr = (UBYTE)(f | (b << 4));
+    curblink = blink && !(ice || ice_force);
 }
 
 static void reset_term(void)
 {
     int y;
-    fg = 7; bg = 0; bold = rev = 0; set_attr();
+    fg = 7; bg = 0; bold = rev = blink = 0; ice = FALSE; set_attr();
     stop = 0; sbot = ROWS - 1; autowrap = TRUE; curvis = TRUE;
     for (y = 0; y < ROWS; y++) blank(y, 0, COLS - 1);
     cx = cy = 0;
@@ -274,7 +464,7 @@ static void reset_term(void)
 
 static void put_glyph(UBYTE c)
 {
-    chr[cy][cx] = c; att[cy][cx] = curattr;
+    chr[cy][cx] = c; att[cy][cx] = curattr; blk[cy][cx] = curblink;
     mark(cy, cx, cx);
     if (++cx >= COLS) {
         /* wrap at once, as SyncTERM (cterm) does: a CR LF after 80 columns double-spaces */
@@ -293,8 +483,10 @@ static void sgr(void)
     if (npar == 0) { npar = 1; par[0] = 0; }
     for (i = 0; i < npar; i++) {
         int p = par[i];
-        if (p == 0) { fg = 7; bg = 0; bold = rev = 0; }
+        if (p == 0) { fg = 7; bg = 0; bold = rev = blink = 0; }
         else if (p == 1) bold = 1;
+        else if (p == 5 || p == 6) blink = 1;
+        else if (p == 25) blink = 0;
         else if (p == 2 || p == 22) bold = 0;
         else if (p == 7) rev = 1;
         else if (p == 27) rev = 0;
@@ -308,7 +500,7 @@ static void sgr(void)
             if (i + 1 < npar && par[i + 1] == 5) i += 2;
             else if (i + 1 < npar && par[i + 1] == 2) i += 4;
         }
-        /* 4/24 underline, 5/6/25 blink, 8 conceal: shown as plain text */
+        /* 4/24 underline, 8 conceal: shown as plain text */
     }
     set_attr();
 }
@@ -324,9 +516,10 @@ static void csi_final(UBYTE f)
             for (i = 0; i < npar; i++) {
                 if (par[i] == 25) curvis = (f == 'h');
                 else if (par[i] == 7) autowrap = (f == 'h');
+                else if (par[i] == 33) { ice = (f == 'h'); set_attr(); }     /* iCE colours */
             }
         }
-        return;                 /* ESC[=..h, ESC[?33h (iCE colours) etc.: ignored */
+        return;                 /* ESC[=..h etc.: ignored */
     }
     switch (f) {
     case 'A': cy = clampi(cy - P(0, 1), cy >= stop ? stop : 0, ROWS - 1); break;
@@ -360,6 +553,7 @@ static void csi_final(UBYTE f)
         n = clampi(P(0, 1), 1, COLS - cx);
         memmove(&chr[cy][cx + n], &chr[cy][cx], COLS - cx - n);
         memmove(&att[cy][cx + n], &att[cy][cx], COLS - cx - n);
+        memmove(&blk[cy][cx + n], &blk[cy][cx], COLS - cx - n);
         mark(cy, cx, COLS - 1);
         blank(cy, cx, cx + n - 1);
         break;
@@ -367,6 +561,7 @@ static void csi_final(UBYTE f)
         n = clampi(P(0, 1), 1, COLS - cx);
         memmove(&chr[cy][cx], &chr[cy][cx + n], COLS - cx - n);
         memmove(&att[cy][cx], &att[cy][cx + n], COLS - cx - n);
+        memmove(&blk[cy][cx], &blk[cy][cx + n], COLS - cx - n);
         mark(cy, cx, COLS - 1);
         blank(cy, COLS - n, COLS - 1);
         break;
@@ -440,6 +635,10 @@ static void ansi_byte(UBYTE c)
         break;
     }
 
+    if (amiga_mode && c >= 0x80 && c < 0xA0) {       /* Amiga: 0x9B is CSI, the rest are controls */
+        if (c == 0x9B) { pstate = S_CSI; npar = 0; par_any = FALSE; priv = 0; inter = FALSE; par[0] = 0; }
+        return;
+    }
     if (c >= 0x20) { put_glyph(c); return; }
     switch (c) {
     case 7: if (!beeped) { DisplayBeep(scr); beeped = TRUE; } break;
@@ -477,6 +676,31 @@ static void capture_byte(UBYTE c)
     if (c == '\n' || c == '\t' || c >= 0x20) cap_put(c);    /* CRs dropped: LF ends a line */
 }
 
+/* ---- the current line, as text: auto-login looks for the prompts, a modem for NO CARRIER ---- */
+static char lg_line[80];                /* lower case, escape sequences left out */
+static int lg_n, lg_esc;
+static char lg_user[40], lg_pass[40];   /* the entry's login (auto-login, Alt+L, rlogin) */
+static BOOL lg_auto;                    /* answer the prompts by ourselves */
+static int lg_stage;                    /* 0 user name next, 1 password next, 2 done */
+static ULONG lg_until;                  /* auto-login gives up after this (seconds) */
+static void line_watch(UBYTE c)
+{
+    if (lg_esc == 1) { lg_esc = (c == '[') ? 2 : 0; return; }
+    if (lg_esc == 2) { if (c >= 0x40 && c <= 0x7E) lg_esc = 0; return; }
+    if (c == 27) { lg_esc = 1; return; }
+    if (c == 0x9B && amiga_mode) { lg_esc = 2; return; }
+    if (c == '\r' || c == '\n') {
+        lg_line[lg_n] = 0;
+        if (ctype == CT_MODEM && !strncmp(lg_line, "no carrier", 10)) closed = TRUE;
+        lg_n = 0;
+        return;
+    }
+    if (c == 8) { if (lg_n) lg_n--; return; }
+    if (c < 0x20) return;
+    if (lg_n >= (int)sizeof(lg_line) - 1) { memmove(lg_line, lg_line + 1, lg_n - 1); lg_n--; }
+    lg_line[lg_n++] = (c >= 'A' && c <= 'Z') ? c + 32 : c;
+}
+
 /* every byte of the session that isn't telnet - the screen, the log, the ZMODEM watcher;
  * while a transfer runs, the transfer's input ring instead */
 static void zm_watch(UBYTE c);
@@ -487,6 +711,7 @@ static void data_byte(UBYTE c)
     if (xfer) { zin_put(c); return; }
     if (cap_fh) capture_byte(c);
     zm_watch(c);
+    line_watch(c);
     ansi_byte(c);
 }
 
@@ -580,6 +805,15 @@ static void tn_byte(UBYTE c)
     }
 }
 
+/* a byte from the other end: telnet unpicks it; raw / rlogin / a modem pass it straight on */
+static BOOL rl_first;                   /* rlogin: the server's first byte is a NUL, "go ahead" */
+static void rx_byte(UBYTE c)
+{
+    if (ctype == CT_TELNET) { tn_byte(c); return; }
+    if (rl_first) { rl_first = FALSE; if (!c) return; }
+    data_byte(c);
+}
+
 /* ---- keyboard --------------------------------------------------------------------------- */
 /* Latin-1 0xA0-0xFF (what the Amiga keymap gives) -> CP437 (what the BBS thinks in) */
 static const UBYTE lat2cp[96] = {
@@ -595,14 +829,16 @@ static void about(void)
 {
     struct EasyStruct es = {
         sizeof(struct EasyStruct), 0, (UBYTE *)"About NilTerm",
-        (UBYTE *)"NilTerm " BBS_VERSION " - an ANSI telnet client for the Amiga\n"
+        (UBYTE *)"NilTerm " BBS_VERSION " - an ANSI BBS terminal for the Amiga\n"
                  "Connected to %s port %ld  (%s)\n\n"
                  "Font: IBM VGA 8x16 from The Ultimate Oldschool PC Font Pack\n"
                  "by VileR, https://int10h.org/oldschool-pc-fonts/  (CC BY-SA 4.0)\n\n"
                  "Alt+D  dialing directory      Alt+H  hang up\n"
-                 "Alt+B  scrollback             Alt+L  capture to a file (on/off)\n"
+                 "Alt+B  scrollback             Alt+C  capture to a file (on/off)\n"
                  "Alt+U  upload (Z/Y/XMODEM)    Alt+R  receive (Z/Y/XMODEM)\n"
-                 "Alt+S  settings (folders, ZMODEM auto-start)\n"
+                 "Alt+L  send user name + password (the directory entry's)\n"
+                 "Alt+Up / Alt+Down  emulated line speed faster / slower\n"
+                 "Alt+S  settings (folders, ZMODEM, modem)\n"
                  "ZMODEM downloads start by themselves; Esc cancels a transfer\n"
                  "Amiga+C  copy the screen      Amiga+V  paste\n"
                  "Alt+X / Amiga+Q  exit         Help  this\n\n"
@@ -618,8 +854,10 @@ static void about(void)
 
 static BOOL quit;
 /* hotkeys the session loop acts on (key() only records them) */
-enum { ACT_NONE, ACT_DIR, ACT_HANGUP, ACT_BACK, ACT_LOG, ACT_UPLOAD, ACT_RECV, ACT_SET, ACT_COPY, ACT_PASTE };
+enum { ACT_NONE, ACT_DIR, ACT_HANGUP, ACT_BACK, ACT_LOG, ACT_UPLOAD, ACT_RECV, ACT_SET, ACT_COPY, ACT_PASTE,
+       ACT_LOGIN };
 static int action;
+static int rate_steps;                  /* Alt+Up / Alt+Down presses not acted on yet */
 static int watch_node;          /* WATCH=n: show node n's caller's screen (read-only) instead of logging on */
 
 static void send_key_str(const char *s) { ob_str(s); ob_flush(); }
@@ -647,7 +885,10 @@ static void key(struct IntuiMessage *m, UWORD code, UWORD qual, APTR prev)
         case 0x25: action = ACT_HANGUP; return;     /* H */
         case 0x32: quit = TRUE; return;             /* X */
         case 0x35: action = ACT_BACK; return;       /* B */
-        case 0x28: action = ACT_LOG; return;        /* L */
+        case 0x33: action = ACT_LOG; return;        /* C: capture (as SyncTERM) */
+        case 0x28: action = ACT_LOGIN; return;      /* L: send the user name / password */
+        case 0x4C: rate_steps++; return;            /* Up: the speed emulation faster */
+        case 0x4D: rate_steps--; return;            /* Down: slower */
         case 0x16: action = ACT_UPLOAD; return;     /* U */
         case 0x13: action = ACT_RECV; return;       /* R */
         case 0x21: action = ACT_SET; return;        /* S */
@@ -692,7 +933,7 @@ static void key(struct IntuiMessage *m, UWORD code, UWORD qual, APTR prev)
     if (buf[0] == 0x9B) return;         /* F-keys etc.: CSI sequences we don't pass on */
     for (i = 0; i < n; i++) {
         UBYTE c = buf[i];
-        if (c >= 0xA0) c = lat2cp[c - 0xA0];
+        if (c >= 0xA0) { if (!amiga_mode) c = lat2cp[c - 0xA0]; }     /* an Amiga BBS: Latin-1 as it is */
         else if (c >= 0x80) continue;
         buf[i] = c;
         ob_data(c);
@@ -729,13 +970,43 @@ static BOOL mode_fits(ULONG id, int w, int h, BOOL bounded)
     return TRUE;
 }
 
+/* the glyphs: the IBM VGA font (CP437), or the ROM's Topaz 8 (Latin-1) for an Amiga BBS,
+ * each row doubled on a 16-line cell */
+static void font_glyphs(BOOL topaz)
+{
+    struct TextAttr ta = { (STRPTR)"topaz.font", 8, FS_NORMAL, FPF_ROMFONT };
+    struct TextFont *tf = topaz ? OpenFont(&ta) : NULL;
+    int c, r;
+    if (topaz && tf && tf->tf_YSize == 8 && !(tf->tf_Flags & FPF_PROPORTIONAL)) {
+        memset(strip, 0, 256 * CH);
+        for (c = tf->tf_LoChar; c <= tf->tf_HiChar && c < 256; c++) {
+            ULONG loc = ((ULONG *)tf->tf_CharLoc)[c - tf->tf_LoChar];
+            int off = loc >> 16, w = loc & 0xFFFF;
+            if (c < 0x20 || (c >= 0x7F && c < 0xA0) || !w) continue;
+            if (w > 8) w = 8;
+            for (r = 0; r < 8; r++) {
+                const UBYTE *row = (const UBYTE *)tf->tf_CharData + r * tf->tf_Modulo;
+                UBYTE b = 0;
+                int i;
+                for (i = 0; i < w; i++)
+                    if (row[(off + i) >> 3] & (0x80 >> ((off + i) & 7))) b |= 0x80 >> i;
+                if (CH == 16) { strip[(2 * r) * 256 + c] = b; strip[(2 * r + 1) * 256 + c] = b; }
+                else strip[r * 256 + c] = b;
+            }
+        }
+    } else {
+        for (c = 0; c < 256; c++)
+            for (r = 0; r < CH; r++)
+                strip[r * 256 + c] = CH == 16 ? nilfont[c][r] : (nilfont[c][2 * r] | nilfont[c][2 * r + 1]);
+    }
+    if (tf) CloseFont(tf);
+}
+
 static BOOL make_font(void)
 {
-    int c, r;
+    int c;
     if (!(strip = AllocVec(256 * CH, MEMF_CHIP | MEMF_CLEAR))) return FALSE;
-    for (c = 0; c < 256; c++)
-        for (r = 0; r < CH; r++)
-            strip[r * 256 + c] = CH == 16 ? nilfont[c][r] : (nilfont[c][2 * r] | nilfont[c][2 * r + 1]);
+    font_glyphs(FALSE);
     for (c = 0; c < 256; c++) charloc[c] = ((ULONG)(c * 8) << 16) | 8;
     charloc[256] = charloc['?'];
     memset(&vfont, 0, sizeof(vfont));
@@ -836,6 +1107,10 @@ static BOOL connect_host(void)
 {
     struct sockaddr_in sa;
     char msg[200];
+    if (!SocketBase) {
+        term_str("\x1b[1;31mNilTerm: no bsdsocket.library - start your TCP/IP stack first\x1b[0m\r\n");
+        return FALSE;
+    }
     memset(&sa, 0, sizeof(sa));
     sa.sin_family = AF_INET;
     sa.sin_port = htons((UWORD)host_port);
@@ -856,6 +1131,20 @@ static BOOL connect_host(void)
         term_str(msg);
         CloseSocket(sock); sock = -1;
         return FALSE;
+    }
+    if (ctype == CT_RLOGIN) {
+        /* \0 client-user \0 server-user \0 terminal/speed \0.  As SyncTERM does it (and
+         * Synchronet expects it): the password goes as the client user, the name as the server one */
+        UBYTE hs[128];
+        int n = 0;
+        const char *cu = lg_pass[0] ? lg_pass : lg_user;
+        hs[n++] = 0;
+        strcpy((char *)hs + n, cu); n += strlen(cu) + 1;
+        strcpy((char *)hs + n, lg_user); n += strlen(lg_user) + 1;
+        strcpy((char *)hs + n, "ansi-bbs/115200"); n += 16;
+        net_send(hs, n);
+        rl_first = TRUE;
+        lg_stage = 1;                   /* the name went in the handshake; a password prompt may follow */
     }
     return TRUE;
 }
@@ -949,6 +1238,7 @@ static BOOL statusbar;                  /* off in WATCH= mode: the node's own 25
 static char st_name[48];                /* the system we're on, or what the directory is doing */
 static ULONG st_since;                  /* seconds, when the call started (0 = not online) */
 static char st_mode[64];                /* scrollback / transfer progress, shown instead of the clock */
+static LONG rate;                       /* the emulated line speed, bps (0 = as fast as it comes) */
 
 static ULONG now_secs(void)
 {
@@ -970,12 +1260,17 @@ static void status_draw(void)
         ULONG s = now_secs() - st_since;
         sprintf(t, "%02lu:%02lu:%02lu", (unsigned long)(s / 3600), (unsigned long)(s / 60 % 60), (unsigned long)(s % 60));
     } else strcpy(t, "offline");
-    n = sprintf(line, " %-24.24s %-9s %3s  Alt: D-ir H-ang B-ack L-og U-p R-cv X",
-                st_name, t, cap_fh ? "LOG" : "   ");
+    {
+        char r[12] = "";
+        if (rate) sprintf(r, "%ld", (long)rate);
+        n = sprintf(line, " %-19.19s %-8s %3s %6s  Alt: D-ir H-ang B-ack C-ap U-p R-cv X",
+                    st_name, t, cap_fh ? "CAP" : "   ", r);
+    }
 fill:
     for (x = 0; x < COLS; x++) {
         chr[y][x] = x < n ? (UBYTE)line[x] : ' ';
         att[y][x] = 0x70;               /* black on grey, like SyncTERM's */
+        blk[y][x] = 0;
     }
     mark(y, 0, COLS - 1);
 }
@@ -993,6 +1288,8 @@ fill:
 #define K_DEL   0x106
 #define K_HELP  0x107
 #define K_QUIT  0x108               /* Amiga+Q, Alt+X, CTRL-C */
+#define K_LEFT  0x109
+#define K_RIGHT 0x10A
 
 static int ui_key(void)
 {
@@ -1014,6 +1311,8 @@ static int ui_key(void)
             switch (code) {
             case 0x4C: return shift ? K_PGUP : K_UP;
             case 0x4D: return shift ? K_PGDN : K_DOWN;
+            case 0x4E: return K_RIGHT;
+            case 0x4F: return K_LEFT;
             case 0x48: return K_PGUP;
             case 0x49: return K_PGDN;
             case 0x70: return K_HOME;
@@ -1044,14 +1343,15 @@ static void put_at(int y, int x, UBYTE a, const char *s, int width)
     for (i = 0; i < width && x + i < COLS; i++) {
         chr[y][x + i] = *s ? (UBYTE)*s++ : ' ';
         att[y][x + i] = a;
+        blk[y][x + i] = 0;
     }
     mark(y, x, x + i - 1);
 }
 
-/* a one-line editor on row y: returns FALSE on Esc (buf left as it was) */
-static BOOL edit_line(int y, const char *prompt, char *buf, int max)
+/* a one-line editor on row y: returns FALSE on Esc (buf left as it was); `hide` shows *s */
+static BOOL edit_line_x(int y, const char *prompt, char *buf, int max, BOOL hide)
 {
-    char w[128];
+    char w[128], shown[128];
     int len, pl = strlen(prompt), k;
     strncpy(w, buf, sizeof(w) - 1); w[sizeof(w) - 1] = 0;
     if (max > (int)sizeof(w) - 1) max = sizeof(w) - 1;
@@ -1060,7 +1360,8 @@ static BOOL edit_line(int y, const char *prompt, char *buf, int max)
     for (;;) {
         put_at(y, 0, 0x0F, "", COLS);
         put_at(y, 1, 0x0B, prompt, pl);
-        put_at(y, pl + 2, 0x4F, w, max + 1);
+        if (hide) { memset(shown, '*', len); shown[len] = 0; }
+        put_at(y, pl + 2, 0x4F, hide ? shown : w, max + 1);
         cursor_hide();
         cx = pl + 2 + len; cy = y;
         curvis = TRUE;
@@ -1078,21 +1379,23 @@ static BOOL edit_line(int y, const char *prompt, char *buf, int max)
     strcpy(buf, w);
     return TRUE;
 }
+static BOOL edit_line(int y, const char *prompt, char *buf, int max) { return edit_line_x(y, prompt, buf, max, FALSE); }
 
 /* ---- scrollback viewer (Alt+B): the saved lines, then the screen as it is ------------------- */
 static void draw_row_from(int y, const UBYTE *c, const UBYTE *a)
 {
     memcpy(chr[y], c, COLS);
     memcpy(att[y], a, COLS);
+    memset(blk[y], 0, COLS);
     mark(y, 0, COLS - 1);
 }
 
 static void scrollback(void)
 {
-    static UBYTE sc[SROWS][COLS], sa[SROWS][COLS];      /* the live screen, put back afterwards */
+    static UBYTE sc[SROWS][COLS], sa[SROWS][COLS], sk[SROWS][COLS];      /* the live screen, put back afterwards */
     int total, top, y, k, oldx = cx, oldy = cy;
     BOOL oldvis = curvis;
-    memcpy(sc, chr, sizeof(sc)); memcpy(sa, att, sizeof(sa));
+    memcpy(sc, chr, sizeof(sc)); memcpy(sa, att, sizeof(sa)); memcpy(sk, blk, sizeof(sk));
     total = sb_count + ROWS;
     top = sb_count;                                    /* first shown line: the screen itself */
     if (!sb_count) { DisplayBeep(scr); return; }
@@ -1120,7 +1423,7 @@ static void scrollback(void)
         if (top < 0) top = 0;
         if (top > total - ROWS) top = total - ROWS;
     }
-    memcpy(chr, sc, sizeof(sc)); memcpy(att, sa, sizeof(sa));
+    memcpy(chr, sc, sizeof(sc)); memcpy(att, sa, sizeof(sa)); memcpy(blk, sk, sizeof(sk));
     for (y = 0; y < SROWS; y++) mark(y, 0, COLS - 1);
     st_mode[0] = 0;
     cx = oldx; cy = oldy; curvis = oldvis;
@@ -1179,17 +1482,25 @@ static struct {
     char dl[200];                       /* downloads go here (an entry's own folder wins); "" = ask once */
     char ul[200];                       /* the upload requester starts here */
     char cap[200];                      /* capture files go here */
-    BOOL autozm;                        /* start ZMODEM downloads by themselves */
+    LONG autozm;                        /* start ZMODEM downloads by themselves */
+    char serdev[64];                    /* the modem: serial.device (or a card's driver) */
+    LONG serunit;
+    LONG serbaud;                       /* Amiga <-> modem speed */
+    LONG rtscts;                        /* hardware handshake */
+    char init[64];                      /* "" = send nothing first */
+    char dial[24];                      /* put before the number: ATDT */
 } prefs;
 
 static void prefs_save(void)
 {
     BPTR fh;
-    char l[260];
+    char l[600];
     if (!(fh = Open((STRPTR)PREFS_FILE, MODE_NEWFILE))) return;
     FPuts(fh, (STRPTR)"; NilTerm settings (Settings: S in the dialing directory, Alt+S during a call)\n");
-    sprintf(l, "download=%s\nupload=%s\ncapture=%s\nautozmodem=%s\n",
-            prefs.dl, prefs.ul, prefs.cap, prefs.autozm ? "yes" : "no");
+    sprintf(l, "download=%s\nupload=%s\ncapture=%s\nautozmodem=%s\n"
+               "serial_device=%s\nserial_unit=%ld\nserial_baud=%ld\nserial_rtscts=%s\nmodem_init=%s\nmodem_dial=%s\n",
+            prefs.dl, prefs.ul, prefs.cap, prefs.autozm ? "yes" : "no",
+            prefs.serdev, (long)prefs.serunit, (long)prefs.serbaud, prefs.rtscts ? "yes" : "no", prefs.init, prefs.dial);
     FPuts(fh, (STRPTR)l);
     Close(fh);
 }
@@ -1201,6 +1512,11 @@ static void prefs_load(void)
     strcpy(prefs.ul, "RAM:");
     strcpy(prefs.cap, "RAM:");
     prefs.autozm = TRUE;
+    strcpy(prefs.serdev, "serial.device");
+    prefs.serbaud = 38400;
+    prefs.rtscts = TRUE;
+    strcpy(prefs.init, "ATZ");
+    strcpy(prefs.dial, "ATDT");
     if ((fh = Open((STRPTR)PREFS_FILE, MODE_OLDFILE))) {
         while (FGets(fh, (STRPTR)l, sizeof(l))) {
             char *e = l + strlen(l);
@@ -1209,6 +1525,12 @@ static void prefs_load(void)
             else if (!strncmp(l, "upload=", 7) && l[7]) strncpy(prefs.ul, l + 7, sizeof(prefs.ul) - 1);
             else if (!strncmp(l, "capture=", 8) && l[8]) strncpy(prefs.cap, l + 8, sizeof(prefs.cap) - 1);
             else if (!strncmp(l, "autozmodem=", 11)) prefs.autozm = (l[11] == 'y' || l[11] == 'Y');
+            else if (!strncmp(l, "serial_device=", 14) && l[14]) strncpy(prefs.serdev, l + 14, sizeof(prefs.serdev) - 1);
+            else if (!strncmp(l, "serial_unit=", 12)) prefs.serunit = atol(l + 12);
+            else if (!strncmp(l, "serial_baud=", 12) && atol(l + 12) > 0) prefs.serbaud = atol(l + 12);
+            else if (!strncmp(l, "serial_rtscts=", 14)) prefs.rtscts = (l[14] == 'y' || l[14] == 'Y');
+            else if (!strncmp(l, "modem_init=", 11)) strncpy(prefs.init, l + 11, sizeof(prefs.init) - 1);
+            else if (!strncmp(l, "modem_dial=", 11)) strncpy(prefs.dial, l + 11, sizeof(prefs.dial) - 1);
         }
         Close(fh);
     } else if (GetVar((STRPTR)"NilTerm/DownloadDir", (STRPTR)prefs.dl, sizeof(prefs.dl), GVF_GLOBAL_ONLY) > 0)
@@ -1267,7 +1589,7 @@ static void clip_copy(void)
         while (e >= 0 && chr[y][e] == ' ') e--;
         for (x = 0; x <= e; x++) {
             UBYTE c = chr[y][x];
-            text[n++] = c >= 0x80 ? cp2lat[c - 0x80] : c < 0x20 ? ' ' : c;
+            text[n++] = c >= 0x80 && !amiga_mode ? cp2lat[c - 0x80] : c < 0x20 ? ' ' : c;
         }
         text[n++] = '\n';
     }
@@ -1307,7 +1629,7 @@ static void clip_paste(void)
                         for (i = 0; i < got; i++) {
                             UBYTE c = b[i];
                             if (c == '\n') c = '\r';
-                            else if (c >= 0xA0) c = lat2cp[c - 0xA0];
+                            else if (c >= 0xA0) { if (!amiga_mode) c = lat2cp[c - 0xA0]; }
                             else if (c < 0x20 && c != '\t' && c != '\r') continue;
                             else if (c >= 0x7F && c < 0xA0) continue;
                             ob_data(c);
@@ -1327,12 +1649,21 @@ static void clip_paste(void)
 #define DIR_MAX  100
 struct DirEnt {
     char name[40];
-    char host[64];
+    char host[64];                      /* host name / address, or a modem's phone number */
     LONG port;                          /* 0 = this Amiga's NilBBS, whatever port it's on */
     LONG calls;
     char last[20];                      /* "28-Sep-26 14:22" */
     char dl[128];                       /* its own download folder, "" = the Settings one */
+    LONG type;                          /* CT_TELNET / CT_RAW / CT_RLOGIN / CT_MODEM */
+    char user[40], pass[40];            /* the login: auto-login, Alt+L, rlogin */
+    LONG autologin;                     /* answer the name / password prompts by ourselves */
+    LONG amimode;                        /* Amiga mode: Topaz, Latin-1, 0x9B = CSI */
+    LONG rate;                          /* emulated line speed, bps (0 = full speed) */
+    LONG ice;                           /* iCE colours from the start */
 };
+static const char *const type_names[] = { "telnet", "raw", "rlogin", "modem", NULL };
+static const LONG rates[] = { 0, 300, 1200, 2400, 9600, 14400, 19200, 28800, 38400, 57600, 115200 };
+#define NRATES ((int)(sizeof(rates) / sizeof(rates[0])))
 static struct DirEnt *cur_ent;          /* the entry being called (NULL: HOST=/PORT= direct mode) */
 static void settings(void);
 static struct DirEnt *dir;
@@ -1342,14 +1673,18 @@ static void dir_save(void)
 {
     BPTR fh;
     int i;
-    char l[300];
+    char l[400];
     if (!(fh = Open((STRPTR)DIR_FILE, MODE_NEWFILE))) return;
-    FPuts(fh, (STRPTR)"; NilTerm dialing directory - [name], then host / port / calls / last\n");
+    FPuts(fh, (STRPTR)"; NilTerm dialing directory - [name], then its settings (passwords are NOT encrypted)\n");
     for (i = 0; i < ndir; i++) {
-        sprintf(l, "\n[%s]\nhost=%s\nport=%ld\ncalls=%ld\nlast=%s\n",
-                dir[i].name, dir[i].host, (long)dir[i].port, (long)dir[i].calls, dir[i].last);
+        struct DirEnt *d = &dir[i];
+        sprintf(l, "\n[%s]\nhost=%s\nport=%ld\ncalls=%ld\nlast=%s\ntype=%s\nscreen=%s\nrate=%ld\nice=%s\nautologin=%s\n",
+                d->name, d->host, (long)d->port, (long)d->calls, d->last, type_names[d->type & 3],
+                d->amimode ? "amiga" : "pc", (long)d->rate, d->ice ? "yes" : "no", d->autologin ? "yes" : "no");
         FPuts(fh, (STRPTR)l);
-        if (dir[i].dl[0]) { sprintf(l, "download=%s\n", dir[i].dl); FPuts(fh, (STRPTR)l); }
+        if (d->dl[0]) { sprintf(l, "download=%s\n", d->dl); FPuts(fh, (STRPTR)l); }
+        if (d->user[0]) { sprintf(l, "user=%s\n", d->user); FPuts(fh, (STRPTR)l); }
+        if (d->pass[0]) { sprintf(l, "password=%s\n", d->pass); FPuts(fh, (STRPTR)l); }
     }
     Close(fh);
 }
@@ -1362,19 +1697,33 @@ static void dir_load(void)
     if ((fh = Open((STRPTR)DIR_FILE, MODE_OLDFILE))) {
         while (FGets(fh, (STRPTR)l, sizeof(l))) {
             char *e = l + strlen(l);
-            while (e > l && (e[-1] == '\n' || e[-1] == '\r' || e[-1] == ' ')) *--e = 0;
+            while (e > l && (e[-1] == '\n' || e[-1] == '\r')) *--e = 0;
             if (l[0] == '[' && e > l + 1 && e[-1] == ']' && ndir < DIR_MAX) {
                 memset(&dir[ndir], 0, sizeof(dir[0]));
+                dir[ndir].autologin = TRUE;
                 e[-1] = 0;
                 strncpy(dir[ndir].name, l + 1, sizeof(dir[0].name) - 1);
                 ndir++;
             } else if (ndir) {
                 struct DirEnt *d = &dir[ndir - 1];
-                if (!strncmp(l, "host=", 5)) strncpy(d->host, l + 5, sizeof(d->host) - 1);
-                else if (!strncmp(l, "port=", 5)) d->port = atol(l + 5);
-                else if (!strncmp(l, "calls=", 6)) d->calls = atol(l + 6);
-                else if (!strncmp(l, "last=", 5)) strncpy(d->last, l + 5, sizeof(d->last) - 1);
-                else if (!strncmp(l, "download=", 9)) strncpy(d->dl, l + 9, sizeof(d->dl) - 1);
+                if (!strncmp(l, "password=", 9)) strncpy(d->pass, l + 9, sizeof(d->pass) - 1);  /* spaces kept */
+                else {
+                    while (e > l && e[-1] == ' ') *--e = 0;
+                    if (!strncmp(l, "host=", 5)) strncpy(d->host, l + 5, sizeof(d->host) - 1);
+                    else if (!strncmp(l, "port=", 5)) d->port = atol(l + 5);
+                    else if (!strncmp(l, "calls=", 6)) d->calls = atol(l + 6);
+                    else if (!strncmp(l, "last=", 5)) strncpy(d->last, l + 5, sizeof(d->last) - 1);
+                    else if (!strncmp(l, "download=", 9)) strncpy(d->dl, l + 9, sizeof(d->dl) - 1);
+                    else if (!strncmp(l, "user=", 5)) strncpy(d->user, l + 5, sizeof(d->user) - 1);
+                    else if (!strncmp(l, "screen=", 7)) d->amimode = (l[7] == 'a' || l[7] == 'A');
+                    else if (!strncmp(l, "rate=", 5)) d->rate = atol(l + 5);
+                    else if (!strncmp(l, "ice=", 4)) d->ice = (l[4] == 'y' || l[4] == 'Y');
+                    else if (!strncmp(l, "autologin=", 10)) d->autologin = (l[10] == 'y' || l[10] == 'Y');
+                    else if (!strncmp(l, "type=", 5)) {
+                        int t;
+                        for (t = 0; type_names[t]; t++) if (!str_icmp(l + 5, type_names[t])) d->type = t;
+                    }
+                }
             }
         }
         Close(fh);
@@ -1383,6 +1732,7 @@ static void dir_load(void)
         memset(&dir[0], 0, sizeof(dir[0]));
         strcpy(dir[0].name, "This Amiga's NilBBS");
         strcpy(dir[0].host, "127.0.0.1");
+        dir[0].autologin = TRUE;
         ndir = 1;
         dir_save();
     }
@@ -1401,6 +1751,16 @@ static void dir_stamp(struct DirEnt *d)
     d->calls++;
 }
 
+static void dir_addr(const struct DirEnt *d, char *addr)
+{
+    if (d->type == CT_MODEM) {
+        if (d->host[0]) sprintf(addr, "modem %.40s", d->host);
+        else strcpy(addr, "serial line");
+    } else if (!d->port) sprintf(addr, "%.40s (local)", d->host);
+    else sprintf(addr, "%s%.40s:%ld", d->type == CT_RLOGIN ? "rlogin " : d->type == CT_RAW ? "raw " : "",
+                 d->host, (long)d->port);
+}
+
 static void dir_draw(int sel, int first, int shown)
 {
     char l[COLS + 8];
@@ -1414,10 +1774,9 @@ static void dir_draw(int sel, int first, int shown)
     put_at(3, 0, 0x08, " -----------------------------------------------------------------------------", COLS);
     for (i = 0; i < shown; i++) {
         int n = first + i;
-        char addr[64];
+        char addr[80];
         if (n >= ndir) break;
-        if (dir[n].port) sprintf(addr, "%s:%ld", dir[n].host, (long)dir[n].port);
-        else sprintf(addr, "%s (local)", dir[n].host);
+        dir_addr(&dir[n], addr);
         sprintf(l, " %-28.28s %-26.26s %5ld  %.15s", dir[n].name, addr, (long)dir[n].calls, dir[n].last);
         put_at(4 + i, 0, n == sel ? 0x70 : 0x07, l, COLS);
     }
@@ -1433,17 +1792,165 @@ static void dir_draw(int sel, int first, int shown)
     flush();
 }
 
+/* ---- a form: one field per line; the entry editor and the Settings screen ---------------------- */
+enum { F_TEXT, F_PASS, F_NUM, F_CHOICE, F_DIR, F_RATE };
+struct Field {
+    const char *label;
+    int type;
+    void *p;                            /* char[] (TEXT/PASS/DIR) or LONG (NUM/CHOICE/RATE) */
+    int max;                            /* the text's size, or the number's digits */
+    const char *const *ch;              /* F_CHOICE: the names, NULL-terminated */
+    const char *blank;                  /* shown for an empty text */
+    const char *help;
+};
+
+static void form_value(const struct Field *f, char *v)
+{
+    LONG n = (f->type == F_NUM || f->type == F_CHOICE || f->type == F_RATE) ? *(LONG *)f->p : 0;
+    switch (f->type) {
+    case F_TEXT: case F_DIR:
+        strncpy(v, (char *)f->p, 70); v[70] = 0;
+        if (!v[0] && f->blank) strcpy(v, f->blank);
+        break;
+    case F_PASS:                        /* set or not - never its length */
+        strcpy(v, ((char *)f->p)[0] ? "********" : f->blank ? f->blank : "");
+        break;
+    case F_NUM: {
+        char t[12];
+        int i = 0;
+        ULONG u = n < 0 ? -n : n;
+        do { t[i++] = '0' + u % 10; u /= 10; } while (u);
+        if (n < 0) t[i++] = '-';
+        while (i) *v++ = t[--i];
+        *v = 0;
+        break;
+    }
+    case F_CHOICE: { int c = 0; while (f->ch[c]) c++; sprintf(v, "< %s >", n >= 0 && n < c ? f->ch[n] : "?"); break; }
+    case F_RATE: if (n) sprintf(v, "< %ld bps >", (long)n); else strcpy(v, "< full speed >"); break;
+    }
+}
+
+static int rate_index(LONG r)
+{
+    int i;
+    for (i = NRATES - 1; i > 0; i--) if (r >= rates[i]) return i;
+    return 0;
+}
+
+/* returns TRUE to keep the changes: the editor's S (or Yes to "save?"), always for Settings */
+static BOOL form(const char *title, struct Field *f, int n, BOOL editor)
+{
+    const int top = 2;
+    int sel = 0, k, i;
+    BOOL changed = FALSE;
+    char oldmode[sizeof(st_mode)];
+    strcpy(oldmode, st_mode);
+    cursor_hide();
+    curvis = FALSE;
+    for (;;) {
+        char l[COLS + 8], v[80];
+        struct Field *c = &f[sel];
+        for (i = 0; i < ROWS; i++) put_at(i, 0, 0x07, "", COLS);
+        put_at(0, 0, 0x4F, "", COLS);
+        put_at(0, 2, 0x4F, title, 50);
+        put_at(0, 56, 0x4B, editor ? "S save   Esc cancel" : "Esc = back (saved)", 23);
+        for (i = 0; i < n; i++) {
+            form_value(&f[i], v);
+            v[54] = 0;                  /* (not "%.54s": libnix prints "%.Ns" of "0" as nothing) */
+            sprintf(l, " %-20s %s", f[i].label, v);
+            put_at(top + i, 1, i == sel ? 0x70 : 0x07, l, COLS - 2);
+        }
+        put_at(top + n + 1, 2, 0x0B, c->help ? c->help : "", COLS - 4);
+        put_at(ROWS - 2, 0, 0x08, " -----------------------------------------------------------------------------", COLS);
+        put_at(ROWS - 1, 0, 0x0B, editor ?
+               " Up/Down pick  Enter change  Left/Right choose  Del clear  S save  Esc cancel" :
+               " Up/Down pick  Enter change  Left/Right choose  Del clear  Esc back", COLS);
+        strcpy(st_mode, title);
+        status_draw();
+        flush();
+        k = ui_key();
+        if (k == K_UP) sel = (sel + n - 1) % n;
+        else if (k == K_DOWN) sel = (sel + 1) % n;
+        else if (k == K_HOME) sel = 0;
+        else if (k == K_END) sel = n - 1;
+        else if (k == K_LEFT || k == K_RIGHT || k == K_ENTER || k == ' ') {
+            int d = k == K_LEFT ? -1 : 1;
+            if (c->type == F_CHOICE) {
+                int cnt = 0;
+                while (c->ch[cnt]) cnt++;
+                *(LONG *)c->p = (*(LONG *)c->p + d + cnt) % cnt;
+                changed = TRUE;
+            } else if (c->type == F_RATE) {
+                *(LONG *)c->p = rates[(rate_index(*(LONG *)c->p) + d + NRATES) % NRATES];
+                changed = TRUE;
+            } else if (k == K_ENTER || k == ' ') {
+                char prompt[24];
+                sprintf(prompt, "%-20s", c->label);
+                if (c->type == F_DIR && AslBase) {
+                    if (ask_drawer(c->label, (char *)c->p, c->max)) changed = TRUE;
+                } else if (c->type == F_NUM) {
+                    char num[12];
+                    sprintf(num, "%ld", (long)*(LONG *)c->p);
+                    if (edit_line(top + sel, prompt, num, c->max)) { *(LONG *)c->p = atol(num); changed = TRUE; if (sel < n - 1) sel++; }
+                } else if (edit_line_x(top + sel, prompt, (char *)c->p, c->max - 1, c->type == F_PASS)) {
+                    changed = TRUE;
+                    if (sel < n - 1) sel++;
+                }
+                curvis = FALSE;
+            }
+        } else if (k == K_DEL && (c->type == F_TEXT || c->type == F_PASS || c->type == F_DIR)) {
+            ((char *)c->p)[0] = 0;
+            changed = TRUE;
+        } else if (editor && (k == 's' || k == 'S')) { strcpy(st_mode, oldmode); return TRUE; }
+        else if (k == K_ESC || k == K_QUIT || (!editor && (k == 'q' || k == 'Q'))) {
+            char yn[4] = "y";
+            if (!editor) { strcpy(st_mode, oldmode); return changed; }
+            if (!changed) { strcpy(st_mode, oldmode); return FALSE; }
+            if (!edit_line(ROWS - 3, "Save the changes? (Y/n)", yn, 1)) continue;   /* Esc: keep editing */
+            strcpy(st_mode, oldmode);
+            return yn[0] != 'n' && yn[0] != 'N';
+        }
+    }
+}
+
 static BOOL dir_edit(struct DirEnt *d)
 {
-    char port[12];
+    static const char *const onoff[] = { "off - Alt+L sends them", "on - answers the prompts", NULL };
+    static const char *const scrn[] = { "PC (CP437, the VGA font)", "Amiga (Latin-1, Topaz)", NULL };
+    static const char *const icec[] = { "when the BBS asks", "always", NULL };
     struct DirEnt e = *d;
-    if (!edit_line(ROWS - 3, "Name:", e.name, sizeof(e.name) - 1) || !e.name[0]) return FALSE;
-    if (!edit_line(ROWS - 3, "Host (name or address):", e.host, sizeof(e.host) - 1) || !e.host[0]) return FALSE;
-    sprintf(port, "%ld", (long)(e.port ? e.port : 23));
-    if (!edit_line(ROWS - 3, "Port (0 = this Amiga's NilBBS):", port, 6)) return FALSE;
-    e.port = atol(port);
-    if (!edit_line(ROWS - 3, "Download folder (blank = Settings' one, ? = pick):", e.dl, sizeof(e.dl) - 1)) return FALSE;
-    if (!strcmp(e.dl, "?")) { e.dl[0] = 0; if (!ask_drawer("Downloads from this system go to", e.dl, sizeof(e.dl))) e.dl[0] = 0; }
+    struct Field f[] = {
+        { "Name", F_TEXT, e.name, sizeof(e.name), NULL, NULL, "What the directory calls it." },
+        { "Connection", F_CHOICE, &e.type, 0, type_names, NULL,
+          "telnet for most BBSes; raw TCP; rlogin; or a modem (set it up in Settings)." },
+        { "Address / number", F_TEXT, e.host, sizeof(e.host), NULL, "(direct serial line)",
+          "Host name or address.  Modem: the number to dial (blank = a direct line)." },
+        { "Port", F_NUM, &e.port, 5, NULL, NULL,
+          "Telnet 23, rlogin 513.  0 = this Amiga's own NilBBS.  (Not used by a modem.)" },
+        { "User name", F_TEXT, e.user, sizeof(e.user), NULL, "(none)",
+          "Sent when the BBS asks for your name / handle (and in the rlogin handshake)." },
+        { "Password", F_PASS, e.pass, sizeof(e.pass), NULL, "(none)",
+          "Sent at the password prompt.  Kept in ENVARC:NilTerm.lst - NOT encrypted." },
+        { "Auto-login", F_CHOICE, &e.autologin, 0, onoff, NULL,
+          "On: answer the name and password prompts by itself.  Off: press Alt+L." },
+        { "Screen", F_CHOICE, &e.amimode, 0, scrn, NULL,
+          "PC for most BBSes; Amiga for BBSes that send Amiga ANSI (Topaz, 0x9B)." },
+        { "Line speed", F_RATE, &e.rate, 0, NULL, NULL,
+          "Show text at a modem's pace, for ANSI animations.  Alt+Up/Down in a call." },
+        { "iCE colours", F_CHOICE, &e.ice, 0, icec, NULL,
+          "Always: blink attribute = bright background (for iCE art), from the start." },
+        { "Download folder", F_DIR, e.dl, sizeof(e.dl), NULL, "(the Settings one)",
+          "This system's downloads go here.  Enter picks a drawer, Del clears it." },
+    };
+    LONG oldtype = e.type;
+    if (!form(d->name[0] ? "NilTerm  -  Edit a system" : "NilTerm  -  Add a system", f, sizeof(f) / sizeof(f[0]), TRUE))
+        return FALSE;
+    if (!e.host[0] && e.type != CT_MODEM) { DisplayBeep(scr); return FALSE; }
+    if (!e.name[0]) strncpy(e.name, e.host[0] ? e.host : "Serial line", sizeof(e.name) - 1);
+    if (e.type != oldtype) {            /* the usual port for the new kind, unless one was set by hand */
+        if (e.type == CT_RLOGIN && (e.port == 23 || !e.port)) e.port = 513;
+        else if (e.type == CT_TELNET && e.port == 513) e.port = 23;
+    }
     *d = e;
     return TRUE;
 }
@@ -1478,6 +1985,8 @@ static int directory(void)
             if (ndir < DIR_MAX) {
                 struct DirEnt d;
                 memset(&d, 0, sizeof(d));
+                d.port = 23;
+                d.autologin = TRUE;
                 if (dir_edit(&d)) { dir[ndir] = d; sel = ndir++; dir_save(); }
             }
             break;
@@ -1502,6 +2011,7 @@ static int directory(void)
                 struct DirEnt d;
                 memset(&d, 0, sizeof(d));
                 d.port = 23;
+                d.autologin = TRUE;
                 if (c) { *c = 0; d.port = atol(c + 1); }
                 strncpy(d.host, hp, sizeof(d.host) - 1);
                 strncpy(d.name, hp, sizeof(d.name) - 1);
@@ -1519,53 +2029,35 @@ static int directory(void)
 /* ---- the Settings screen (S in the directory, Alt+S during a call) ------------------------------ */
 static void settings(void)
 {
-    static UBYTE sc[SROWS][COLS], sa[SROWS][COLS];      /* whatever was on screen, put back afterwards */
-    static const char *label[] = { "Download folder", "Upload folder", "Capture folder", "ZMODEM downloads" };
-    static const char *help[] = {
-        "Where downloads are saved - a directory entry's own folder wins over this one.",
-        "Where the upload file requester opens.",
-        "Where Alt+L capture files go.",
-        "Yes: a ZMODEM download starts by itself.  No: use Alt+R to receive one." };
-    int sel = 0, k, i, oldx = cx, oldy = cy;
-    BOOL oldvis = curvis, changed = FALSE;
-    char oldmode[sizeof(st_mode)];
-    memcpy(sc, chr, sizeof(sc)); memcpy(sa, att, sizeof(sa));
-    strcpy(oldmode, st_mode);
-    cursor_hide();
-    curvis = FALSE;
-    for (;;) {
-        char l[COLS + 8];
-        for (i = 0; i < ROWS; i++) put_at(i, 0, 0x07, "", COLS);
-        put_at(0, 0, 0x4F, "", COLS);
-        put_at(0, 2, 0x4F, "NilTerm  -  Settings", 40);
-        put_at(0, 59, 0x4B, "Esc = back (saved)", 20);
-        for (i = 0; i < 4; i++) {
-            const char *v = i == 0 ? (prefs.dl[0] ? prefs.dl : "(ask the first time)") :
-                            i == 1 ? prefs.ul : i == 2 ? prefs.cap : prefs.autozm ? "start by themselves" : "Alt+R only";
-            sprintf(l, " %-18s %.58s", label[i], v);
-            put_at(3 + i * 2, 1, i == sel ? 0x70 : 0x07, l, COLS - 2);
-        }
-        put_at(13, 2, 0x0B, help[sel], COLS - 4);
-        put_at(ROWS - 2, 0, 0x08, " -----------------------------------------------------------------------------", COLS);
-        put_at(ROWS - 1, 0, 0x0B, " Up/Down pick   Enter change (a folder requester, or yes/no)   Esc back", COLS);
-        strcpy(st_mode, "Settings");
-        status_draw();
-        flush();
-        k = ui_key();
-        if (k == K_UP && sel > 0) sel--;
-        else if (k == K_DOWN && sel < 3) sel++;
-        else if (k == K_ENTER || k == ' ') {
-            if (sel == 3) { prefs.autozm = !prefs.autozm; changed = TRUE; }
-            else {
-                char *f = sel == 0 ? prefs.dl : sel == 1 ? prefs.ul : prefs.cap;
-                if (ask_drawer(label[sel], f, sizeof(prefs.dl))) changed = TRUE;
-            }
-        } else if (k == K_ESC || k == K_QUIT || k == 'q' || k == 'Q') break;
-    }
-    if (changed) prefs_save();
-    memcpy(chr, sc, sizeof(sc)); memcpy(att, sa, sizeof(sa));
+    static UBYTE sc[SROWS][COLS], sa[SROWS][COLS], sk[SROWS][COLS];   /* what was on screen, put back afterwards */
+    static const char *const zm[] = { "Alt+R only", "start by themselves", NULL };
+    static const char *const yn[] = { "off", "on (RTS/CTS)", NULL };
+    struct Field f[] = {
+        { "Download folder", F_DIR, prefs.dl, sizeof(prefs.dl), NULL, "(ask the first time)",
+          "Where downloads are saved - a directory entry's own folder wins over this one." },
+        { "Upload folder", F_DIR, prefs.ul, sizeof(prefs.ul), NULL, NULL, "Where the upload file requester opens." },
+        { "Capture folder", F_DIR, prefs.cap, sizeof(prefs.cap), NULL, NULL, "Where Alt+C capture files go." },
+        { "ZMODEM downloads", F_CHOICE, &prefs.autozm, 0, zm, NULL,
+          "Start by themselves when the BBS sends one, or only with Alt+R." },
+        { "Serial device", F_TEXT, prefs.serdev, sizeof(prefs.serdev), NULL, NULL,
+          "For modem entries: serial.device, or your serial card's driver." },
+        { "Serial unit", F_NUM, &prefs.serunit, 3, NULL, NULL, "The device's unit number (0 for the built-in port)." },
+        { "Serial speed", F_NUM, &prefs.serbaud, 6, NULL, NULL,
+          "Amiga <-> modem speed (bps): 19200, 38400, 57600, 115200..." },
+        { "Hardware handshake", F_CHOICE, &prefs.rtscts, 0, yn, NULL, "RTS/CTS flow control - leave on for a modem." },
+        { "Modem init", F_TEXT, prefs.init, sizeof(prefs.init), NULL, "(none)",
+          "Sent before dialling, e.g. ATZ or AT&F1.  Blank = nothing." },
+        { "Dial command", F_TEXT, prefs.dial, sizeof(prefs.dial), NULL, NULL,
+          "Put before the number: ATDT (tone) or ATDP (pulse)." },
+    };
+    int i, oldx = cx, oldy = cy;
+    BOOL oldvis = curvis;
+    memcpy(sc, chr, sizeof(sc)); memcpy(sa, att, sizeof(sa)); memcpy(sk, blk, sizeof(sk));
+    if (form("NilTerm  -  Settings", f, sizeof(f) / sizeof(f[0]), FALSE)) prefs_save();
+    if (!prefs.ul[0]) strcpy(prefs.ul, "RAM:");
+    if (!prefs.cap[0]) strcpy(prefs.cap, "RAM:");
+    memcpy(chr, sc, sizeof(sc)); memcpy(att, sa, sizeof(sa)); memcpy(blk, sk, sizeof(sk));
     for (i = 0; i < SROWS; i++) mark(i, 0, COLS - 1);
-    strcpy(st_mode, oldmode);
     cx = oldx; cy = oldy; curvis = oldvis;
     status_draw();
     flush();
@@ -1629,22 +2121,19 @@ static void xfer_status(BOOL force)
 LONG tn_wait(ULONG ms, ULONG extrasigs, ULONG *gotsigs)
 {
     static UBYTE buf[4096];
-    fd_set r;
-    struct timeval tv;
-    ULONG sigs = (1UL << win->UserPort->mp_SigBit) | SIGBREAKF_CTRL_C;
-    LONG n;
+    ULONG winsig = 1UL << win->UserPort->mp_SigBit, sigs;
+    LONG n, room, i;
     (void)extrasigs;
     if (gotsigs) *gotsigs = 0;
     ob_flush();
     if (in_avail()) return in_avail();
-    if (closed || sock < 0) { N.online = FALSE; return 0; }
+    if (closed || (sock < 0 && !ser_open_ok)) { N.online = FALSE; return 0; }
     xfer_status(FALSE);
-    FD_ZERO(&r);
-    FD_SET(sock, &r);
-    tv.tv_sec = ms / 1000; tv.tv_usec = (ms % 1000) * 1000;
-    n = WaitSelect(sock + 1, &r, NULL, NULL, &tv, &sigs);
+    room = ZIN_SIZE - 1 - in_avail();
+    if (room > (LONG)sizeof(buf)) room = sizeof(buf);
+    n = conn_wait(buf, room, ms ? ms : 1, winsig | SIGBREAKF_CTRL_C, &sigs);
     if (sigs & SIGBREAKF_CTRL_C) N.online = FALSE;
-    if (sigs & (1UL << win->UserPort->mp_SigBit)) {     /* Esc: cancel; other keys: ignored */
+    if (sigs & winsig) {                /* Esc: cancel; other keys: ignored */
         struct IntuiMessage *m;
         while ((m = (struct IntuiMessage *)GetMsg(win->UserPort))) {
             if (m->Class == IDCMP_RAWKEY && m->Code == 0x45) N.online = FALSE;
@@ -1652,15 +2141,8 @@ LONG tn_wait(ULONG ms, ULONG extrasigs, ULONG *gotsigs)
             ReplyMsg((struct Message *)m);
         }
     }
-    if (n > 0 && FD_ISSET(sock, &r)) {
-        LONG room = ZIN_SIZE - 1 - in_avail(), got, i;
-        if (room > (LONG)sizeof(buf)) room = sizeof(buf);
-        if (room > 0) {
-            got = recv(sock, buf, room, 0);
-            if (got <= 0) { closed = TRUE; N.online = FALSE; }
-            else for (i = 0; i < got; i++) tn_byte(buf[i]);
-        }
-    }
+    if (n < 0) { closed = TRUE; N.online = FALSE; }
+    else for (i = 0; i < n; i++) rx_byte(buf[i]);
     return in_avail();
 }
 
@@ -1787,6 +2269,189 @@ static void receive_xy(void)
     xfer_end(n, "saved in", dir);
 }
 
+/* ---- a modem: init, dial, wait for CONNECT (what it says is shown as it comes) ----------------- */
+#define M_FAIL 0
+#define M_CONNECT 1
+#define M_OK 2
+#define M_ABORT 3
+static int modem_result(int secs)
+{
+    ULONG winsig = 1UL << win->UserPort->mp_SigBit, until = now_secs() + secs;
+    char line[80];
+    int ln = 0;
+    while (now_secs() < until) {
+        UBYTE b[64];
+        ULONG sigs;
+        LONG n = conn_wait(b, sizeof(b), 200, winsig | SIGBREAKF_CTRL_C, &sigs), i;
+        if (sigs & SIGBREAKF_CTRL_C) { quit = TRUE; return M_ABORT; }
+        if (sigs & winsig) {
+            struct IntuiMessage *m;
+            BOOL esc = FALSE;
+            while ((m = (struct IntuiMessage *)GetMsg(win->UserPort))) {
+                if (m->Class == IDCMP_RAWKEY && m->Code == 0x45) esc = TRUE;
+                ReplyMsg((struct Message *)m);
+            }
+            if (esc) return M_ABORT;
+        }
+        if (n < 0) return M_FAIL;
+        for (i = 0; i < n; i++) {
+            UBYTE c = b[i];
+            ansi_byte(c);
+            if (c != '\r' && c != '\n') { if (ln < (int)sizeof(line) - 1) line[ln++] = c; continue; }
+            line[ln] = 0;
+            ln = 0;
+            if (!strncmp(line, "CONNECT", 7)) { flush(); return M_CONNECT; }
+            if (!strcmp(line, "OK")) { flush(); return M_OK; }
+            if (!strncmp(line, "NO CARRIER", 10) || !strncmp(line, "BUSY", 4) || !strncmp(line, "NO DIAL", 7) ||
+                !strncmp(line, "NO ANSWER", 9) || !strncmp(line, "ERROR", 5)) { flush(); return M_FAIL; }
+        }
+        flush();
+    }
+    return M_FAIL;
+}
+
+static void modem_cmd(const char *s) { ser_write((const UBYTE *)s, strlen(s)); ser_write((const UBYTE *)"\r", 1); }
+
+static BOOL modem_connect(void)
+{
+    char msg[200];
+    int r;
+    if (!ser_open(prefs.serdev, prefs.serunit, prefs.serbaud, prefs.rtscts)) {
+        sprintf(msg, "\x1b[1;31mNilTerm: can't open %s unit %ld (Settings: the serial device)\x1b[0m\r\n",
+                prefs.serdev, (long)prefs.serunit);
+        term_str(msg);
+        return FALSE;
+    }
+    if (!host_name[0]) {
+        term_str("\x1b[0;36mDirect serial line - you're on.\x1b[0m\r\n");
+        return TRUE;
+    }
+    if (prefs.init[0]) {
+        modem_cmd(prefs.init);
+        if (!ser_stuck && modem_result(5) == M_ABORT) { ser_close(); return FALSE; }
+    }
+    if (!ser_stuck) {
+        sprintf(msg, "%s%s", prefs.dial, host_name);
+        modem_cmd(msg);
+    }
+    if (ser_stuck) {
+        term_str("\x1b[1;31mNilTerm: the serial port won't send - the modem isn't giving CTS.\r\n"
+                 "Is it on and connected?  (A cable without handshake lines: Settings, Hardware handshake off.)\x1b[0m\r\n");
+        closed = FALSE;
+        ser_close();
+        return FALSE;
+    }
+    r = modem_result(90);
+    if (r == M_CONNECT) return TRUE;
+    if (r == M_ABORT) { modem_cmd(""); Delay(25); term_str("\r\n\x1b[1;31mDialling cancelled\x1b[0m\r\n"); }
+    else term_str("\r\n\x1b[1;31mNo connection\x1b[0m\r\n");
+    ser_close();
+    return FALSE;
+}
+
+static void modem_hangup(void)
+{
+    if (!ser_open_ok) return;
+    if (host_name[0] && !closed) {      /* dialled and still on: back to command mode, hang up */
+        Delay(60); ser_write((const UBYTE *)"+++", 3); Delay(60); modem_cmd("ATH0"); Delay(25);
+    }
+    ser_close();                        /* DTR drops too */
+}
+
+/* ---- auto-login: the entry's name at a name prompt, its password at a password prompt --------- */
+static void login_send(const char *s) { while (*s) ob_data((UBYTE)*s++); ob_put('\r'); ob_flush(); }
+
+static void login_check(void)
+{
+    char t[80];
+    int n = lg_n;
+    if (!lg_auto || lg_stage >= 2 || (!lg_user[0] && !lg_pass[0])) return;
+    if (now_secs() > lg_until) { lg_stage = 2; return; }
+    memcpy(t, lg_line, n); t[n] = 0;
+    while (n && t[n - 1] == ' ') t[--n] = 0;
+    if (!n || (t[n - 1] != ':' && t[n - 1] != '?' && t[n - 1] != '>')) return;
+    if (strstr(t, "password") || strstr(t, "passwd")) {
+        if (lg_pass[0]) { login_send(lg_pass); lg_stage = 2; lg_n = 0; }
+        return;
+    }
+    if (lg_stage == 0 && lg_user[0] &&
+        (strstr(t, "name") || strstr(t, "handle") || strstr(t, "login") || strstr(t, "user") || strstr(t, "alias"))) {
+        login_send(lg_user);
+        lg_stage = lg_pass[0] ? 1 : 2;
+        lg_n = 0;
+    }
+}
+
+static void login_hotkey(void)          /* Alt+L */
+{
+    if (!lg_user[0] && !lg_pass[0]) { DisplayBeep(scr); return; }
+    if (lg_stage == 0 && lg_user[0]) login_send(lg_user);
+    if (lg_pass[0]) login_send(lg_pass);
+    lg_stage = 2;
+}
+
+/* ---- the speed emulation: what arrives waits here, and comes out at rate/10 characters a second -- */
+#define RQ_SIZE 8192
+static UBYTE rq[RQ_SIZE];
+static int rq_head, rq_tail, rq_n;
+static ULONG rq_last;
+
+static void rq_add(const UBYTE *p, LONG n)
+{
+    while (n-- > 0 && rq_n < RQ_SIZE) { rq[rq_head] = *p++; rq_head = (rq_head + 1) % RQ_SIZE; rq_n++; }
+}
+static UBYTE rq_get(void) { UBYTE c = rq[rq_tail]; rq_tail = (rq_tail + 1) % RQ_SIZE; rq_n--; return c; }
+
+static void after_input(void)
+{
+    ob_flush();         /* telnet answers + cursor reports, in order */
+    flush();
+    login_check();
+    if (zm_go) zm_download();
+}
+
+/* release n queued bytes (all of them if a download starts: the rest is its) */
+static void rq_release(LONG n)
+{
+    cursor_hide();
+    beeped = FALSE;
+    while (n-- > 0 && rq_n) {
+        rx_byte(rq_get());
+        if (xfer) { while (rq_n) rx_byte(rq_get()); break; }
+    }
+    after_input();
+}
+
+static void blink_tick(void)
+{
+    int y, x;
+    BOOL any = FALSE;
+    for (y = 0; y < ROWS; y++)
+        for (x = 0; x < COLS; x++)
+            if (blk[y][x]) { any = TRUE; mark(y, x, x); }
+    if (!any) { blink_off = FALSE; return; }
+    blink_off = !blink_off;
+    cursor_hide();
+    flush();
+}
+
+static ULONG st_clear_at;               /* a passing status message goes at this time (seconds) */
+static void rate_step(int d)
+{
+    while (d) {
+        int i = rate_index(rate);
+        if (d > 0) { i = rate ? i + 1 : 0; if (i >= NRATES) i = 0; d--; }   /* past the fastest: full */
+        else { i = rate ? i - 1 : NRATES - 1; if (i < 1) i = 1; d++; }      /* slowest is 300 */
+        rate = rates[i];
+    }
+    if (!rate && rq_n) rq_release(rq_n);
+    rq_last = now_us();
+    if (rate) sprintf(st_mode, "line speed %ld bps  (Alt+Up / Alt+Down)", (long)rate);
+    else strcpy(st_mode, "line speed: full  (Alt+Up / Alt+Down)");
+    st_clear_at = now_secs() + 2;
+    cursor_hide(); status_draw(); flush();
+}
+
 /* ---- one call: connect, run the terminal until it ends ------------------------------------------ */
 enum { END_CLOSED, END_HANGUP, END_DIR, END_QUIT };
 static BOOL direct_mode;                /* HOST=/PORT= given: one call, no directory (BBSControl's Logon) */
@@ -1794,54 +2459,88 @@ static BOOL direct_mode;                /* HOST=/PORT= given: one call, no direc
 static int session(void)
 {
     static UBYTE buf[4096];
-    ULONG shown_s = 0;
-    int why = END_CLOSED;
+    ULONG shown_s = 0, blink_t, winsig = 1UL << win->UserPort->mp_SigBit;
+    int why = END_CLOSED, y;
     char msg[200];
+    BOOL ok;
 
     memset(us, 0, sizeof(us)); memset(them, 0, sizeof(them));
     tstate = T_DATA; pstate = S_NORM; closed = FALSE; obn = 0; action = ACT_NONE;
+    ctype = cur_ent ? (int)cur_ent->type & 3 : CT_TELNET;
+    amiga_mode = cur_ent && cur_ent->amimode;
+    ice_force = cur_ent && cur_ent->ice;
+    rate = cur_ent ? cur_ent->rate : 0;
+    lg_user[0] = lg_pass[0] = 0;
+    if (cur_ent) {
+        strncpy(lg_user, cur_ent->user, sizeof(lg_user) - 1);
+        strncpy(lg_pass, cur_ent->pass, sizeof(lg_pass) - 1);
+    }
+    lg_auto = cur_ent && cur_ent->autologin;
+    lg_stage = 0; lg_n = 0; lg_esc = 0;
+    rl_first = FALSE;
+    rq_n = rq_head = rq_tail = 0;
+    blink_off = FALSE;
+    if (ctype != CT_TELNET) them[O_ECHO] = 1;       /* no telnet talk: the other end echoes */
+    font_glyphs(amiga_mode);
+    for (y = 0; y < SROWS; y++) mark(y, 0, COLS - 1);
     cursor_hide();
     reset_term();
     curvis = TRUE;
     st_since = 0; st_mode[0] = 0;
-    sprintf(msg, "\x1b[0;36mNilTerm - connecting to %s port %ld...\x1b[0m\r\n", host_name, (long)host_port);
+    if (ctype == CT_MODEM)
+        sprintf(msg, "\x1b[0;36mNilTerm - %s%s on %s unit %ld...\x1b[0m\r\n", host_name[0] ? "dialling " : "opening the line",
+                host_name, prefs.serdev, (long)prefs.serunit);
+    else
+        sprintf(msg, "\x1b[0;36mNilTerm - connecting to %s port %ld%s...\x1b[0m\r\n", host_name, (long)host_port,
+                ctype == CT_RLOGIN ? " (rlogin)" : ctype == CT_RAW ? " (raw)" : "");
     term_str(msg);
     status_draw();
     flush();
-    if (!connect_host()) { status_draw(); wait_any_key(10); return END_CLOSED; }
+    ok = ctype == CT_MODEM ? modem_connect() : connect_host();
+    if (!ok) {
+        status_draw();
+        if (!quit) wait_any_key(10);
+        if (amiga_mode) { amiga_mode = FALSE; font_glyphs(FALSE); }
+        ctype = CT_TELNET;
+        return quit ? END_QUIT : END_CLOSED;
+    }
     st_since = now_secs();
+    lg_until = st_since + 120;
+    rq_last = blink_t = now_us();
 
-    while (!quit && !closed) {
-        fd_set r;
-        struct timeval tv;
-        ULONG sigs = (1UL << win->UserPort->mp_SigBit) | SIGBREAKF_CTRL_C, s;
-        LONG n;
-        FD_ZERO(&r);
-        FD_SET(sock, &r);
-        tv.tv_sec = 1; tv.tv_usec = 0;              /* the status bar clock */
-        n = WaitSelect(sock + 1, &r, NULL, NULL, &tv, &sigs);
-        if (n < 0) break;
+    while (!quit && (!closed || rq_n)) {
+        ULONG sigs = 0, s, now;
+        LONG got = 0, room = sizeof(buf);
+        ULONG ms = (rate && rq_n) ? 20 : 250;
+        if (rate && room > RQ_SIZE - rq_n) room = RQ_SIZE - rq_n;
+        if (closed || room <= 0) sigs = sig_wait(ms, winsig | SIGBREAKF_CTRL_C);
+        else got = conn_wait(buf, room, ms, winsig | SIGBREAKF_CTRL_C, &sigs);
+        if (got < 0) { closed = TRUE; got = 0; }
         if (sigs & SIGBREAKF_CTRL_C) { quit = TRUE; break; }
-        if (sigs & (1UL << win->UserPort->mp_SigBit)) handle_idcmp();
-        if (n > 0 && FD_ISSET(sock, &r)) {
-            /* a burst: everything that's waiting (up to 32 KB) into the cells, then one redraw */
-            LONG total = 0;
-            cursor_hide();
-            beeped = FALSE;
-            for (;;) {
-                LONG got = recv(sock, buf, sizeof(buf), 0), i;
-                if (got <= 0) { closed = TRUE; break; }
-                for (i = 0; i < got; i++) tn_byte(buf[i]);
-                total += got;
-                if (total >= 32768 || xfer) break;     /* a download starting: the rest is its */
-                FD_ZERO(&r); FD_SET(sock, &r);
-                tv.tv_sec = 0; tv.tv_usec = 0;
-                if (WaitSelect(sock + 1, &r, NULL, NULL, &tv, NULL) <= 0) break;
+        if (sigs & winsig) handle_idcmp();
+        if (got > 0) {
+            if (rate) rq_add(buf, got);
+            else {
+                /* a burst: everything that's waiting (up to 32 KB) into the cells, then one redraw */
+                LONG total = 0, i;
+                cursor_hide();
+                beeped = FALSE;
+                for (;;) {
+                    for (i = 0; i < got; i++) rx_byte(buf[i]);
+                    total += got;
+                    if (total >= 32768 || xfer || closed) break;     /* a download starting: the rest is its */
+                    got = conn_wait(buf, sizeof(buf), 0, 0, &s);
+                    if (got <= 0) { if (got < 0) closed = TRUE; break; }
+                }
+                after_input();
             }
-            ob_flush();         /* telnet answers + cursor reports, in order */
-            flush();
-            if (zm_go) zm_download();
         }
+        now = now_us();
+        if (rate && rq_n) {
+            LONG cps = rate / 10, allow = (LONG)((now - rq_last) / 1000) * cps / 1000;
+            if (allow > 0) { rq_last += (ULONG)allow * (1000000UL / cps); rq_release(allow); }
+        } else rq_last = now;
+        if (now - blink_t >= 500000) { blink_t = now; blink_tick(); }
         if ((s = now_secs()) != shown_s) { shown_s = s; cursor_hide(); status_draw(); flush(); }
         if (action) {
             int a = action;
@@ -1855,9 +2554,15 @@ static int session(void)
             else if (a == ACT_UPLOAD) upload();
             else if (a == ACT_RECV) receive_xy();
             else if (a == ACT_SET) settings();
+            else if (a == ACT_LOGIN) login_hotkey();
+        }
+        if (rate_steps) { int d = rate_steps; rate_steps = 0; rate_step(d); }
+        if (st_clear_at && now_secs() >= st_clear_at && !xfer) {
+            st_clear_at = 0; st_mode[0] = 0; cursor_hide(); status_draw(); flush();
         }
     }
     if (quit) why = END_QUIT;
+    if (ctype == CT_MODEM) modem_hangup();
     if (sock >= 0) { CloseSocket(sock); sock = -1; }
     if (cap_fh) { cap_flush(); Close(cap_fh); cap_fh = 0; }
     st_since = 0;
@@ -1868,6 +2573,10 @@ static int session(void)
         flush();
         Delay(60);              /* the goodbye screen, a moment */
     }
+    if (amiga_mode) { amiga_mode = FALSE; font_glyphs(FALSE); for (y = 0; y < SROWS; y++) mark(y, 0, COLS - 1); }
+    blink_off = FALSE;
+    ctype = CT_TELNET;
+    rate = 0;
     return why;
 }
 
@@ -1883,9 +2592,12 @@ static int real_main(void)
         say("NilTerm: needs AmigaOS 3.0 or newer\n");
         goto out;
     }
-    if (!watch_node && !(SocketBase = OpenLibrary((STRPTR)"bsdsocket.library", 4))) {
-        say("NilTerm: no bsdsocket.library - start your TCP/IP stack first\n");
-        goto out;
+    SocketBase = OpenLibrary((STRPTR)"bsdsocket.library", 4);   /* optional: a modem needs none */
+    if ((tm_port = CreateMsgPort()) &&
+        (tm_io = (struct timerequest *)CreateIORequest(tm_port, sizeof(struct timerequest)))) {
+        if (OpenDevice((STRPTR)TIMERNAME, UNIT_MICROHZ, (struct IORequest *)tm_io, 0)) {
+            DeleteIORequest((struct IORequest *)tm_io); tm_io = NULL;
+        } else TimerBase = tm_io->tr_node.io_Device;
     }
     AslBase = OpenLibrary((STRPTR)"asl.library", 38);
     IFFParseBase = OpenLibrary((STRPTR)"iffparse.library", 39);
@@ -1941,7 +2653,7 @@ static int real_main(void)
             if (i < 0) break;
             strncpy(host_name, dir[i].host, sizeof(host_name) - 1);
             host_port = dir[i].port;
-            if (!host_port) default_port();
+            if (!host_port && dir[i].type != CT_MODEM) default_port();
             strncpy(st_name, dir[i].name, sizeof(st_name) - 1);
             cur_ent = &dir[i];
             dir_stamp(&dir[i]);
@@ -1952,6 +2664,9 @@ static int real_main(void)
 
 out:
     if (sock >= 0) CloseSocket(sock);
+    ser_close();
+    if (tm_io) { CloseDevice((struct IORequest *)tm_io); DeleteIORequest((struct IORequest *)tm_io); }
+    if (tm_port) DeleteMsgPort(tm_port);
     if (cap_fh) { cap_flush(); Close(cap_fh); }
     if (dir) FreeVec(dir);
     if (sb_chr) FreeVec(sb_chr);

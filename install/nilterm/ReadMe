@@ -1,15 +1,17 @@
-NilTerm - an ANSI telnet client for the Amiga
-=============================================
+NilTerm - an ANSI BBS terminal for the Amiga
+============================================
 
-NilTerm calls telnet BBSes the way SyncTERM does on a PC: its own screen with
-80 columns of the IBM PC font in the 16 PC colours, a dialing directory, a
-status bar, scrollback, session capture, and ZMODEM downloads that start by
-themselves.  The full manual is NilTerm.guide.
+NilTerm calls BBSes the way SyncTERM does on a PC: its own screen with 80
+columns of the IBM PC font in the 16 PC colours, a dialing directory with
+auto-login, a status bar, scrollback, session capture, and ZMODEM downloads
+that start by themselves.  Telnet, rlogin, raw TCP, or a modem on the serial
+port; an Amiga screen mode (Topaz, Latin-1) for Amiga BBSes; modem-speed
+emulation for ANSI animations; iCE colours.  The full manual is NilTerm.guide.
 
 NEEDS
   AmigaOS 3.0+ on a 68020 or better, and a TCP/IP stack (Roadshow, AmiTCP,
-  Miami, or an emulator's bsdsocket emulation).  A 640x400 screen mode: a
-  graphics card, or the chipset's High Res Laced.
+  Miami, or an emulator's bsdsocket emulation) - or just a modem.  A 640x400
+  screen mode: a graphics card, or the chipset's High Res Laced.
 
 INSTALLING
   Double-click Install_NilTerm.  It copies the NilTerm drawer (the program,
@@ -23,10 +25,15 @@ USING IT
   Double-click NilTerm: the dialing directory opens.
     A add a system  E edit  D delete  C quick connect host:port
     S settings      Return call it     Q quit
+  A system's entry holds its connection (telnet / raw / rlogin / modem),
+  address or phone number, user name + password (auto-login), screen (PC or
+  Amiga), line speed, iCE colours and download folder.
   On a call:
-    Alt+D directory   Alt+H hang up    Alt+B scrollback  Alt+L capture
-    Alt+U upload      Alt+R receive    Alt+S settings    Alt+X quit
+    Alt+D directory   Alt+H hang up    Alt+B scrollback  Alt+C capture
+    Alt+L send login  Alt+U upload     Alt+R receive     Alt+S settings
+    Alt+Up/Down line speed             Alt+X quit
     Amiga+C copy the screen   Amiga+V paste   Help the keys
+  (Capture moved from Alt+L to Alt+C in 1.2, as in SyncTERM.)
   ZMODEM downloads start by themselves; Esc cancels a transfer.  Downloads go
   to the system's own folder (set in its directory entry) or the one in
   Settings.
@@ -34,7 +41,8 @@ USING IT
   From a Shell:  NilTerm HOST=bbs.example.org PORT=23   calls straight away.
 
 FILES
-  ENVARC:NilTerm.lst     the dialing directory
+  ENVARC:NilTerm.lst     the dialing directory (passwords in it are NOT
+                         encrypted)
   ENVARC:NilTerm.prefs   the settings
 
 CREDITS

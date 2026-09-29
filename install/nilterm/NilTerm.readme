@@ -1,26 +1,32 @@
-Short:        ANSI telnet BBS client (SyncTERM-style)
+Short:        ANSI BBS terminal: telnet/rlogin/modem
 Author:       NilBBS
 Uploader:     NilBBS
 Type:         comm/tcp
-Version:      1.1
-Requires:     AmigaOS 3.0+, 68020+, bsdsocket.library TCP/IP stack
+Version:      1.2
+Requires:     AmigaOS 3.0+, 68020+, a TCP/IP stack or a modem
 Architecture: m68k-amigaos >= 3.0.0
 
-NilTerm calls telnet BBSes the way SyncTERM does on a PC.
+NilTerm calls BBSes the way SyncTERM does on a PC.
 
  - Its own 640x400 16-colour screen (graphics card or High Res Laced) with
    80 columns of the IBM VGA 8x16 font and the PC's colours; full ANSI
    (cursor movement, colours, scroll regions, insert/delete), CP437.
  - Telnet done properly: terminal type ANSI, window size, binary mode, and
    the cursor-position answers BBSes use to detect ANSI.
- - A dialing directory: name, host, port and a download folder per system,
-   call counts and last-call dates; quick connect to any host:port.
+ - Telnet, rlogin, raw TCP, or a modem / direct line on the serial port.
+ - A dialing directory: per system its connection, address or phone number,
+   user name + password with auto-login (or Alt+L), screen, line speed,
+   iCE colours and download folder; call counts and last-call dates;
+   quick connect to any host:port.
+ - An Amiga screen mode for Amiga BBSes: Topaz from ROM, Latin-1, 0x9B CSI.
+ - Modem-speed emulation (300-115200 bps, Alt+Up/Down) for ANSI animations;
+   iCE colours (bright backgrounds) and blinking text.
  - A status bar with the system and time online; Alt-key hotkeys.
  - ZMODEM downloads that start by themselves; ZMODEM, YMODEM and XMODEM(-1K)
    upload and download; progress on the status bar, Esc cancels.
  - 2000 lines of scrollback, session capture (raw ANSI or plain text),
    copy the screen to the clipboard and paste into a call.
- - Settings for the download / upload / capture folders.
+ - Settings for the download / upload / capture folders and the modem.
 
 Install with the included Installer script, or copy the NilTerm drawer
 anywhere.  The manual is NilTerm.guide.

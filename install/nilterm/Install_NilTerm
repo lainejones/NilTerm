@@ -23,16 +23,18 @@
            "Run the installer from the drawer it came in (the one holding NilTerm)."))
 
 (message "Welcome to NilTerm.\n\n"
-         "NilTerm is an ANSI telnet client for calling BBSes: the IBM PC font and "
-         "colours on its own screen, a dialing directory, scrollback, session capture "
-         "and ZMODEM / YMODEM / XMODEM file transfers.\n\n"
-         "It needs a TCP/IP stack (Roadshow, Miami or AmiTCP) to make calls.")
+         "NilTerm is an ANSI terminal for calling BBSes: the IBM PC font and "
+         "colours on its own screen, a dialing directory with auto-login, scrollback, "
+         "session capture and ZMODEM / YMODEM / XMODEM file transfers.\n\n"
+         "It calls over telnet, rlogin or raw TCP (with a TCP/IP stack: Roadshow, "
+         "Miami or AmiTCP), or dials out with a modem on the serial port.")
 
 (if (= (exists "LIBS:bsdsocket.library") 0)
     (if (= (exists "bsdsocket.library" (resident)) 0)
         (message "No bsdsocket.library was found in LIBS:.\n\n"
                  "That's fine if your TCP/IP stack keeps it elsewhere or is started later "
-                 "(Roadshow and Miami do) - NilTerm needs it only when it makes a call.")))
+                 "(Roadshow and Miami do) - NilTerm needs it only for telnet, rlogin and raw "
+                 "calls.  Modem calls don't need it.")))
 
 ; ---- where ---------------------------------------------------------------
 (set instdest
