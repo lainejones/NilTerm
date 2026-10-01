@@ -2,7 +2,7 @@ Short:        ANSI BBS terminal: telnet/rlogin/modem
 Author:       NilBBS
 Uploader:     NilBBS
 Type:         comm/tcp
-Version:      1.4
+Version:      1.5
 Requires:     AmigaOS 3.0+, 68020+, a TCP/IP stack or a modem
 Architecture: m68k-amigaos >= 3.0.0
 
