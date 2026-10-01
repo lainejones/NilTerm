@@ -540,7 +540,9 @@ static void csi_final(UBYTE f)
         n = P(0, 0);
         if (n == 0) { blank(cy, cx, COLS - 1); for (y = cy + 1; y < ROWS; y++) blank(y, 0, COLS - 1); }
         else if (n == 1) { for (y = 0; y < cy; y++) blank(y, 0, COLS - 1); blank(cy, 0, cx); }
-        else { for (y = 0; y < ROWS; y++) blank(y, 0, COLS - 1); if (n == 2) cx = cy = 0; }  /* ANSI.SYS homes */
+        else if (n == 2) { for (y = 0; y < ROWS; y++) blank(y, 0, COLS - 1); cx = cy = 0; }  /* ANSI.SYS homes */
+        else if (n == 3) sb_head = sb_count = 0;    /* xterm: the scrollback only - the screen stays
+                                                     * (Craps sends it with every prompt; it blanked the game) */
         break;
     case 'K':
         n = P(0, 0);
