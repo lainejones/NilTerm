@@ -183,6 +183,9 @@ ULONG door_launch_sync(const char *cmd, const char *dir, LONG stack);
 BOOL  door_launch_done(void);
 LONG  door_launch_finish(void);
 void  cnet_mci_write(const UBYTE *s, LONG len, UBYTE srccs);
+BOOL  cnet_getuser_raw(LONG spec, char *out, int max);
+void  cnet_set_pfile(const char *title, const char *loc);   /* PortData.Select0 (the pfile title / folder) */
+void  cnet_set_edbuff(UBYTE v);                             /* PortData.edbuff: CALLEDITOR's answer */
 
 /* cnetc.c */
 void  run_cnetc(const char *tag, const char *cmd, const char *dir, LONG stack,
@@ -223,6 +226,8 @@ int   bulletins_new(void);
 void  voting_booth(void);
 int   voting_waiting(void);
 void  finger(void);
+BOOL  file_send_path(const char *path, const char *name);     /* fileui.c: one file, the caller's protocol */
+LONG  file_receive_dir(const char *dir, char names[][32], LONG max, const char *xname);
 void  plan_edit(void);
 void  plan_path(ULONG id, char *buf);
 
@@ -248,6 +253,10 @@ struct Editor {
     int  n;
 };
 int   ed_quote(struct Editor *ed, int at, const char *quote, const char *qfrom);
+int   msg_door_edit(struct Editor *ed, const char *subj);   /* msgui.c: 1 saved, 0 aborted */
+BOOL  msg_area_is_email(int i);
+int   msg_area_count(void);
+ULONG msg_post_text(int ai, const char *to, const char *subj, ULONG replyto, const char *text);
 
 /* fse.c: 1 = save, 0 = abort, -1 = hung up */
 int   fse_edit(struct Editor *ed, const char *quote, const char *qfrom, const char *to, const char *subj);

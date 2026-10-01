@@ -241,6 +241,7 @@ BOOL  ipf_save_bans(struct BBSShared *s, const char *path);
 #define UF_LINEEDIT   0x0040    /* prefers the line editor over the full-screen one */
 #define UF_HIDDEN     0x0080    /* never listed in last callers (sysop-set) */
 #define UF_NEWUSER    0x0100    /* signed up, waiting for the sysop to validate (validated_level) */
+#define UF_NOMORE     0x0200    /* no -- More -- pauses (lists, bulletins, doors' files) */
 
 struct UserRec {
     ULONG id;                   /* record number + 1; 0 = unused */
@@ -275,7 +276,8 @@ struct UserRec {
     UBYTE proto;                    /* file transfer protocol, PROTO_* (zmodem.h) */
     UBYTE pad2[2];
     char  lang[16];                 /* language file (BBS:Text/Language/<lang>.lng), "" = board default */
-    UBYTE reserved[164];
+    LONG  gamepoints;               /* CNet "game points": door ADDPOINTS / GETUSER 21 */
+    UBYTE reserved[160];
 };                                  /* on-disk record: exactly 768 bytes */
 #define USERREC_SIZE 768
 typedef char userrec_size_check[(sizeof(struct UserRec) == USERREC_SIZE) ? 1 : -1];

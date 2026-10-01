@@ -27,8 +27,8 @@ struct CfgEnt {
 
 struct Cfg {
     struct CfgEnt *first, *last;
-    LONG nsect;
-    char *sect[64];
+    LONG nsect, cap;
+    char **sect;                    /* section names in file order; grows (a door list can pass 64) */
 };
 
 static char *dupstr(const char *s)
@@ -59,7 +59,14 @@ struct Cfg *cfg_load(const char *path)
             char *end = strchr(p, ']');
             if (end) *end = 0;
             str_copy(section, str_trim(p + 1), sizeof(section));
-            if (c->nsect < 64) c->sect[c->nsect++] = dupstr(section);
+            if (c->nsect == c->cap) {
+                LONG nc = c->cap ? c->cap * 2 : 32;
+                char **ns = AllocVec(nc * sizeof(char *), MEMF_ANY);
+                if (!ns) continue;
+                if (c->sect) { CopyMem(c->sect, ns, c->nsect * sizeof(char *)); FreeVec(c->sect); }
+                c->sect = ns; c->cap = nc;
+            }
+            c->sect[c->nsect++] = dupstr(section);
             continue;
         }
         if (!(eq = strchr(p, '='))) continue;
@@ -114,6 +121,7 @@ void cfg_free(struct Cfg *c)
         FreeVec(e);
     }
     for (i = 0; i < c->nsect; i++) if (c->sect[i]) FreeVec(c->sect[i]);
+    if (c->sect) FreeVec(c->sect);
     FreeVec(c);
 }
 
