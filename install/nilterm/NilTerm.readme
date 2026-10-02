@@ -2,7 +2,7 @@ Short:        ANSI BBS terminal: telnet/rlogin/modem
 Author:       NilBBS
 Uploader:     NilBBS
 Type:         comm/tcp
-Version:      1.5
+Version:      1.5.1
 Requires:     AmigaOS 3.0+, 68020+, a TCP/IP stack or a modem
 Architecture: m68k-amigaos >= 3.0.0
 
@@ -29,7 +29,8 @@ NilTerm calls BBSes the way SyncTERM does on a PC.
  - Settings for the download / upload / capture folders and the modem.
 
 Install with the included Installer script, or copy the NilTerm drawer
-anywhere.  The manual is NilTerm.guide.
+anywhere.  The manual is NilTerm.guide.  Use the .lha: a .zip can't carry
+the AmigaDOS protection bits (then: Protect NilTerm/NilTerm +e).
 
 NilTerm is part of NilBBS, a telnet BBS for AmigaOS.  MIT licence.
 

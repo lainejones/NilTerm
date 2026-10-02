@@ -61,6 +61,8 @@
     (choices "NilTerm" "NilTerm.guide" "ReadMe" "LICENSE")
     (infos)
     (nogauge))
+; a .zip (or a copy that lost them) leaves the program without its protection bits
+(protect (tackon termdir "NilTerm") "+e")
 (complete 90)
 
 (exit

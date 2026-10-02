@@ -21,6 +21,10 @@ INSTALLING
 
   By hand: copy the NilTerm drawer anywhere.  That's all it needs.
 
+  Use the .lha: a .zip can't carry the AmigaDOS protection bits.  After
+  unpacking a .zip, run  Protect NilTerm/NilTerm +e  (the installer does it
+  for you).
+
 USING IT
   Double-click NilTerm: the dialing directory opens.
     A add a system  E edit  D delete  C quick connect host:port
