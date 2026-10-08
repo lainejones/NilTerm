@@ -1,3 +1,4 @@
 * text=auto eol=lf
 *.ans binary
 *.lha binary
+*.info binary
